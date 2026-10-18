@@ -1,0 +1,13 @@
+# Minimal build context: the image only needs the Dockerfile and root/.
+.git
+.gitattributes
+.gitignore
+.github
+.env
+.env.example
+config/
+*.md
+docker-compose.yml
+templates/
+ca_profile.xml
+LICENSE

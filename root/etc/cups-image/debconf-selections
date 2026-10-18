@@ -1,0 +1,12 @@
+# debconf answers fed to `debconf-set-selections` BEFORE the packages are installed.
+#
+# cups' postinst links the backends named here from /usr/lib/cups/backend-available into
+# /usr/lib/cups/backend. Ubuntu's default is "lpd, socket, usb, snmp, dnssd"; we keep only:
+#   usb     - the printer this image exists to share
+#   socket  - AppSocket/JetDirect (socket://host:9100), for network printers and the CI smoke test
+# dnssd is NOT needed to *publish* queues over DNS-SD/AirPrint (cupsd does that itself through
+# avahi-client); it is only the client-side backend for printing TO discovered printers. lpd and
+# snmp (network discovery) are likewise unused here. Fewer root-run backends, less attack surface.
+# The Dockerfile asserts the resulting directory contents, so a change in this behaviour fails the
+# build instead of silently re-adding backends.
+cups cupsys/backend multiselect usb, socket

@@ -1,0 +1,43 @@
+version: 2
+updates:
+  # The actions in build.yml / ci.yml / upstream-watch.yml run with a GHCR push credential or an
+  # issues-write token in scope, so they are pinned to commit SHAs. Dependabot is what keeps those
+  # pins from rotting.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Deliberate, not a restatement of a default: Dependabot has NO default cooldown - omit the
+    # block and updates arrive immediately. Cooldown applies to version updates only; security
+    # updates are exempt by design, which is what makes auto-merging them safe.
+    #
+    # Three days, and no more, because SHA pinning is the real defence here and cooldown is only
+    # backup. The tj-actions/changed-files compromise (CVE-2025-30066) ran ~15 hours before
+    # detection and ~23 to a safe version - but it worked by retroactively repointing existing
+    # version tags: no new version, no PR, and therefore no cooldown involved at all.
+    cooldown:
+      default-days: 3
+
+  # The LSIO base image digest pin in the Dockerfile (baseimage-ubuntu:resolute@sha256:...). Docker
+  # is not a GitHub Advisory Database ecosystem, so these arrive as routine version updates with no
+  # security metadata attached - never as security updates.
+  #
+  # Ubuntu PACKAGE updates do not come through here at all: the daily build's package fingerprint
+  # picks those up on its own. This only moves the base layer itself (s6-overlay, LSIO init, the
+  # base's own userland, which the build also `apt-get upgrade`s).
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Three days is a measured ceiling, not a copy of the value above.
+    #
+    # Cooldown measures the age of the tag's CURRENT digest, so it must sit BELOW the upstream
+    # rebuild interval. Above it, the digest is never old enough to clear the window, no PR ever
+    # opens, and the pin silently freezes while the daily rebuilds keep baking a stale base.
+    #
+    # Measured 2026-08 for docker-openclaw from linuxserver/docker-baseimage-ubuntu releases
+    # ls64..ls82 (19 noble releases, 18 intervals): modal gap exactly 7.0 days, minimum 3.4 days,
+    # with occasional 14d and 22.9d outliers. resolute is rebuilt by the same LSIO pipeline; 3 clears
+    # the 3.4-day minimum with the little headroom there is. Re-measure on resolute before raising it.
+    cooldown:
+      default-days: 3

@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: CUPS (upstream, OpenPrinting) issues
+    url: https://github.com/OpenPrinting/cups/issues
+    about: For bugs in CUPS itself, rather than this packaging.
+  - name: Ubuntu's CUPS package (Launchpad)
+    url: https://bugs.launchpad.net/ubuntu/+source/cups
+    about: For problems specific to Ubuntu's build of CUPS, or to ask about a pending security update.

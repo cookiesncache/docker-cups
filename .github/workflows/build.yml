@@ -1,0 +1,298 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'root/**'
+      - '.dockerignore'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      # There is no `adopt` switch here (compare docker-openclaw): this image has no upstream image
+      # to hold back under a cooldown. Its inputs are the digest-pinned base (moved by Dependabot
+      # PRs that pr-smoke boots before they merge) and Ubuntu's archive, which ships what Ubuntu has
+      # already released to every Ubuntu machine.
+      force:
+        description: 'Rebuild and push even if no build input changed'
+        type: boolean
+        default: false
+  schedule:
+    # Daily, not weekly. The Ubuntu archive is a build input that moves on its own: when Ubuntu
+    # publishes a CUPS, Ghostscript or OpenSSL security update, the gate's package fingerprint
+    # changes and that day's run publishes it. On a quiet day the gate costs one apt simulation and
+    # one registry read, then exits. Daily also catches a Dependabot base bump merged by
+    # dependabot-auto-merge.yml: a merge made with GITHUB_TOKEN does not trigger another workflow.
+    #
+    # Off the hour on purpose: scheduled runs at :00 are the ones GitHub delays or drops under load.
+    - cron: '17 6 * * *'
+
+# A push landing while the scheduled run is mid-flight would otherwise give two runs that both
+# decide "changed", both push, and race on :latest. Queue them; never cancel one mid-push.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/cups
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------------------------------------------------------------------
+      # WHETHER to publish, decided in .github/scripts/gate.sh by comparing a fingerprint of every
+      # build input against the one annotated on the published index - one registry read, no
+      # external state, and no way to drift from what actually shipped:
+      #
+      #   - the git object ids of Dockerfile, root/ and .dockerignore (content, not $GITHUB_SHA: a
+      #     docs-only commit must not publish an image that differs only in BUILD_DATE, which every
+      #     Unraid install would see as a phantom update). The base digest is in the Dockerfile.
+      #   - APT_FINGERPRINT: the exact name=version set the Dockerfile's apt step resolves to inside
+      #     the pinned base, from packages.txt - the one package list the Dockerfile also installs.
+      #
+      # gate.sh is deliberately NOT an input: it decides what to build, it is not in the image.
+      # ---------------------------------------------------------------------
+      - name: Decide whether to publish
+        id: gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_FORCE: ${{ inputs.force }}
+          APT_RESOLUTION_FILE: ${{ runner.temp }}/apt-resolution.txt
+        run: bash .github/scripts/gate.sh
+
+      # Smoke-test BEFORE publishing. This is the only gate on the scheduled path, which is where
+      # Ubuntu package updates arrive - a Ghostscript or cups-filters update that breaks the M203
+      # chain, or a postinst that re-adds a backend, would otherwise ship straight to :latest.
+      #
+      # Deliberately a plain `docker buildx build`, not the build-push-action: the docker exporter
+      # cannot carry attestations, and keeping the test build out of the action means there is
+      # exactly one build-push-action invocation and its provenance setting is never in question.
+      # The layers are shared via the builder and the gha cache, so the push build below is cheap.
+      #
+      # APT_FINGERPRINT must be the SAME value at both build sites - both read the gate's single
+      # output. It sits above the apt layer, so a mismatch would smoke-test one package set and push
+      # another (and the diff_id check below would fail the run).
+      - name: Build for smoke test (local only, never pushed)
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          APT_FINGERPRINT: ${{ steps.gate.outputs.apt_fingerprint }}
+        run: |
+          set -euo pipefail
+          docker buildx build --load -t cups:smoke \
+            --build-arg "APT_FINGERPRINT=${APT_FINGERPRINT}" \
+            --cache-from type=gha \
+            --cache-to type=gha,mode=max \
+            .
+
+      # The fingerprint is a claim about the image - "it contains exactly these package versions" -
+      # so prove it before anything is tagged with it. Then take the CUPS version from the image that
+      # was built (its /package_versions.txt), never from a second apt query that could answer
+      # differently minutes later: the published version must describe the published bytes.
+      - name: Package versions and tags
+        id: meta
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          RESOLUTION: ${{ runner.temp }}/apt-resolution.txt
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          bash .github/scripts/gate.sh --check-image cups:smoke "$RESOLUTION"
+
+          PKGS=$(docker run --rm --entrypoint cat cups:smoke /package_versions.txt)
+          VER=$(sed -n 's/^cups-daemon=//p' <<< "$PKGS")
+          # version, version_base and build_tag - validated, and sanitised to the tag charset, by
+          # gate.sh (covered by its --self-test).
+          META=$(bash .github/scripts/gate.sh --tags "$VER" "$RUN_NUMBER")
+          printf '%s\n' "$META" >> "$GITHUB_OUTPUT"
+          VER_BASE=$(sed -n 's/^version_base=//p' <<< "$META")
+          BUILD_TAG=$(sed -n 's/^build_tag=//p' <<< "$META")
+
+          # :latest and :<upstream> (e.g. :2.4.16) float to the newest build by design. The build tag
+          # (e.g. :2.4.16-1ubuntu1.3-ls12) is immutable and never re-pushed - LinuxServer's
+          # convention, and what the README tells people to pin. No tag by repo commit: the dominant
+          # publish trigger is Ubuntu moving with HEAD unchanged, so a commit tag would be re-pushed
+          # over different content and read as a pin while behaving like :latest.
+          TAGS="${IMAGE}:latest"
+          if [ -n "$VER_BASE" ]; then
+            TAGS="${TAGS},${IMAGE}:${VER_BASE}"
+          fi
+          TAGS="${TAGS},${IMAGE}:${BUILD_TAG}"
+          {
+            echo "tags=${TAGS}"
+            echo "date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } >> "$GITHUB_OUTPUT"
+          echo "CUPS package ${VER}; tags: ${TAGS}"
+
+      - name: Smoke test the built image
+        if: steps.gate.outputs.publish == 'true'
+        run: bash .github/scripts/smoke.sh cups:smoke
+
+      - name: Build and push
+        if: steps.gate.outputs.publish == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          # Unraid's update check (DockerClient.php) accepts the Docker v2
+          # manifest/list types and the OCI *index* type, but never
+          # application/vnd.oci.image.manifest.v1+json. `provenance: false` on a
+          # single-platform build pushes exactly that bare OCI manifest, so GHCR
+          # answers Unraid with 404 -> "not available" -> auto-update never fires.
+          # Keeping provenance on wraps the image in an OCI index, which Unraid
+          # reads (same shape the LSIO base images publish).
+          provenance: mode=min
+          # io.cookiesncache.inputs is what the next gate run compares against; the apt fingerprint
+          # beside it lets the gate say WHICH input moved. base.name/base.digest are the standard OCI
+          # keys for the LSIO base this was built FROM.
+          annotations: |
+            index:io.cookiesncache.inputs=${{ steps.gate.outputs.hash }}
+            index:io.cookiesncache.cups.apt.fingerprint=${{ steps.gate.outputs.apt_fingerprint }}
+            index:org.opencontainers.image.base.name=${{ steps.gate.outputs.base_name }}
+            index:org.opencontainers.image.base.digest=${{ steps.gate.outputs.base_digest }}
+            index:org.opencontainers.image.revision=${{ github.sha }}
+            index:org.opencontainers.image.created=${{ steps.meta.outputs.date }}
+            index:org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          # APT_FINGERPRINT must be the SAME value the smoke build above used - both read the gate
+          # step's single output. (Comments cannot live inside the build-args block below: the action
+          # parses every line there as a literal KEY=VALUE.)
+          build-args: |
+            BUILD_DATE=${{ steps.meta.outputs.date }}
+            VERSION=${{ steps.meta.outputs.build_tag }}
+            APT_FINGERPRINT=${{ steps.gate.outputs.apt_fingerprint }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---------------------------------------------------------------------
+      # The image that was smoke-tested must be the image that got pushed.
+      #
+      # The two builds are separate invocations that share layers only through the builder and gha
+      # caches, so nothing structurally guarantees they produce identical filesystems: a cache miss,
+      # or a build-arg passed to one and not the other, would silently publish layers that were never
+      # booted. APT_FINGERPRINT makes that hazard real rather than theoretical, because it sits ABOVE
+      # the apt layer - unlike BUILD_DATE and VERSION, a mismatch changes actual content.
+      #
+      # Compared as rootfs diff_ids (uncompressed), which both sides expose: the local image via
+      # docker inspect, the pushed one via its config blob. LABEL-only differences create no layers,
+      # so the BUILD_DATE/VERSION asymmetry between the two builds does not show up here.
+      #
+      # Read with the job's own token rather than anonymously: GHCR creates a new package PRIVATE, so
+      # on the very first publish an anonymous read would 401 here before anyone could flip it public.
+      # (The Unraid check below stays anonymous on purpose - that is what Unraid does.)
+      # ---------------------------------------------------------------------
+      - name: Verify the pushed image is the one that was smoke-tested
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          BUILD_TAG: ${{ steps.meta.outputs.build_tag }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          REPO_PATH="${OWNER}/cups"
+          ACCEPT='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json'
+          TOKEN=$(curl -fsSL -u "${GITHUB_ACTOR}:${GH_TOKEN}" \
+                    "https://ghcr.io/token?scope=repository:${REPO_PATH}:pull&service=ghcr.io" | jq -r .token)
+
+          IDX=$(curl -fsSL -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+                  "https://ghcr.io/v2/${REPO_PATH}/manifests/${BUILD_TAG}")
+          MAN_DIGEST=$(printf '%s' "$IDX" | jq -r '.manifests[]? | select(.platform.architecture=="amd64") | .digest')
+          if [ -n "$MAN_DIGEST" ]; then
+            MAN=$(curl -fsSL -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" \
+                    "https://ghcr.io/v2/${REPO_PATH}/manifests/${MAN_DIGEST}")
+          else
+            MAN="$IDX"
+          fi
+          CFG_DIGEST=$(printf '%s' "$MAN" | jq -r '.config.digest')
+          PUSHED=$(curl -fsSL -H "Authorization: Bearer $TOKEN" \
+                     "https://ghcr.io/v2/${REPO_PATH}/blobs/${CFG_DIGEST}" | jq -c '.rootfs.diff_ids')
+          SMOKED=$(docker inspect cups:smoke --format '{{json .RootFS.Layers}}' | jq -c '.')
+
+          if [ "$PUSHED" = "$SMOKED" ]; then
+            echo "::notice::pushed image is layer-identical to the smoke-tested image"
+          else
+            echo "::error::the pushed image is NOT the image that was smoke-tested"
+            echo "  smoked: $SMOKED"
+            echo "  pushed: $PUSHED"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------------
+      # The published manifest must stay readable by Unraid's update check.
+      #
+      # DockerClient.php sends the exact Accept header below, anonymously. It does NOT include
+      # application/vnd.oci.image.manifest.v1+json, so if a push ever produces a bare OCI image
+      # manifest instead of an index, GHCR answers 404, unraid-update-status.json records
+      # "remote": null, the UI column reads "not available", and CA Auto Update silently stops
+      # firing for every install (docker-openclaw shipped exactly that once).
+      #
+      # Anonymous on purpose. A 401 here on the first publish means the new GHCR package is still
+      # private - Unraid could not pull it either. Make the package public (Package settings ->
+      # Change visibility) and re-run the workflow.
+      #
+      # pr-smoke cannot catch this - it builds with --load and never pushes, so it never sees what
+      # the registry serves. This is the only check that does.
+      # ---------------------------------------------------------------------
+      - name: Verify the published manifest is readable by Unraid
+        if: steps.gate.outputs.publish == 'true'
+        env:
+          VER_BASE: ${{ steps.meta.outputs.version_base }}
+          BUILD_TAG: ${{ steps.meta.outputs.build_tag }}
+        run: |
+          set -euo pipefail
+          OWNER=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          REPO_PATH="${OWNER}/cups"
+          ACCEPT='application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json'
+          # Tolerated: a refused anonymous token surfaces as the per-tag error below, which says why.
+          TOKEN=$(curl -fsSL "https://ghcr.io/token?scope=repository:${REPO_PATH}:pull&service=ghcr.io" | jq -r .token) || TOKEN=""
+
+          fail=0
+          for tag in latest "$VER_BASE" "$BUILD_TAG"; do
+            [ -n "$tag" ] || continue
+            URL="https://ghcr.io/v2/${REPO_PATH}/manifests/${tag}"
+            result=""
+            for attempt in 1 2 3; do
+              # -w avoids parsing headers (and their CRLFs) altogether.
+              result=$(curl -so /dev/null -w '%{http_code} %{content_type}' -H "Authorization: Bearer $TOKEN" -H "Accept: $ACCEPT" "$URL")
+              case "$result" in 200*) break ;; esac
+              echo "  :${tag} attempt ${attempt} -> ${result}"
+              sleep 5
+            done
+            code=${result%% *}
+            ctype=${result#* }
+            echo "  :${tag} -> HTTP ${code} ${ctype}"
+
+            if [ "$code" != "200" ]; then
+              echo "::error::GHCR returned ${code} for :${tag} under Unraid's anonymous Accept header - update checks would break for every install (a 401 on a first publish means the package is still private)"
+              fail=1
+              continue
+            fi
+            case "$ctype" in
+              *oci.image.index.v1+json*|*manifest.list.v2+json*|*distribution.manifest.v2+json*) ;;
+              *)
+                echo "::error::tag ${tag} is ${ctype}, a type Unraid's Accept header does not include - update checks would break"
+                fail=1
+                ;;
+            esac
+          done
+          [ "$fail" = 0 ] || exit 1
+          echo "::notice::published manifests are readable with Unraid's Accept header"

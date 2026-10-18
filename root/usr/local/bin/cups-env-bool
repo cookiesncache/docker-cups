@@ -1,0 +1,38 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# cups-env-bool NAME [DEFAULT]
+#
+# Prints "true" or "false" for the boolean environment variable NAME (e.g. CUPS_AIRPRINT), using
+# DEFAULT (itself "false" when omitted) if the variable is unset or empty - Unraid passes blank
+# template fields through as empty strings. Accepts true/false, yes/no, on/off, 1/0 in any case.
+# Anything else exits 1 with a message on stderr.
+#
+# Its stdout *is* its return value (callers capture it with $(...)), so it prints NOTHING else
+# there. The services that call it fall back to "false" - the less exposed state - if it fails;
+# init-cups-config has already refused to start the container on an invalid value by then, so that
+# fallback only matters if someone runs a service by hand.
+#
+# Debug with:  docker exec <container> cups-env-bool CUPS_AIRPRINT
+
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/docker-cups/common.sh
+source /usr/local/lib/docker-cups/common.sh
+
+name="${1:-}"
+default="${2:-false}"
+
+# Only plain upper-case variable names, and never a secret: the error path echoes the value.
+if [[ ! "${name}" =~ ^[A-Z][A-Z0-9_]*$ || "${name}" == *PASSWORD* ]]; then
+    printf 'usage: cups-env-bool NAME [DEFAULT]\n' >&2
+    exit 2
+fi
+
+value="${!name:-}"
+if cups_parse_bool "${value}" "${default}"; then
+    printf '%s\n' "${CUPS_OUT}"
+else
+    printf '%s=%s: %s\n' "${name}" "$(cups_show "${value}")" "${CUPS_WHY}" >&2
+    exit 1
+fi

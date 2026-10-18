@@ -1,0 +1,777 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# init-cups-config (oneshot) - everything cupsd needs before it may start, on every boot:
+#
+#   1. refuse to run on top of a host D-Bus mount            (fail closed, nothing deleted)
+#   2. validate every CUPS_* / PRINTER_* variable             (fail closed on anything invalid)
+#   3. seed /config/cups from /defaults, import an old-template appdata layout
+#   4. create/update/remove the web-UI admin account          (soft: problems disable admin)
+#   5. generate cupsd.conf + cups-files.conf                  (unless CUPS_MANAGED_CONFIG=false)
+#   6. one stable TLS certificate for every name cupsd may present
+#   7. AirPrint: avahi-daemon.conf, stale pid cleanup
+#   8. print the security posture to the log                  (never the password)
+#
+# "Fail closed" = exit non-zero. The Dockerfile sets S6_BEHAVIOUR_IF_STAGE2_FAILS=2, so s6-overlay
+# stops the container and these messages are the last thing in `docker logs`. Every service depends
+# on this oneshot (via init-config-end -> ... -> init-services), so cupsd never starts on bad input
+# even if that variable is overridden.
+
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../../../usr/local/lib/docker-cups/common.sh
+source /usr/local/lib/docker-cups/common.sh
+
+CONFIG_ROOT=/config/cups
+SEED_ROOT=/defaults/cups
+POLICIES=/defaults/cupsd-policies.conf
+DEFAULT_NETWORKS="@LOCAL 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 [fc00::]/7"
+
+# ================================================================================================
+# 1. Host D-Bus guard - first, before anything below could touch /run/dbus.
+# ================================================================================================
+/usr/local/bin/cups-dbus-guard || exit 1
+
+# ================================================================================================
+# 2. Validate the environment. Every problem is collected and reported together, then we stop.
+# ================================================================================================
+errors=()
+bad() { errors+=("$1"); }
+
+# Control characters (a newline above all) are refused in EVERY value before any other parsing: a
+# value that reaches cupsd.conf with an embedded newline would be a second, attacker-chosen
+# directive. Only the password is exempt from echoing - it is checked separately, without logging.
+for var in CUPS_ALLOWED_NETWORKS CUPS_ADMIN_NETWORKS CUPS_SERVER_ALIASES CUPS_PAPER_SIZE \
+           CUPS_LOG_LEVEL CUPS_WEB_INTERFACE CUPS_AIRPRINT CUPS_AIRPRINT_HOSTNAME \
+           CUPS_MANAGED_CONFIG CUPS_ADMIN_USER PRINTER_NAME PRINTER_MODEL PRINTER_URI \
+           PRINTER_DESCRIPTION PRINTER_LOCATION PRINTER_OPTIONS; do
+    if cups_has_ctrl "${!var:-}"; then
+        if [[ "${var}" == PRINTER_URI ]]; then
+            # A device URI may carry a network printer's password: never log it unredacted.
+            bad "${var}=$(cups_show "$(cups_redact_uri "${!var}")") contains a control character (newline, tab, ...)"
+        else
+            bad "${var}=$(cups_show "${!var}") contains a control character (newline, tab, ...)"
+        fi
+        # Blank it so the parsers below do not report the same variable a second time.
+        printf -v "${var}" '%s' ""
+        declare -g "${var}_REJECTED=1"
+    fi
+done
+
+# --- booleans -----------------------------------------------------------------------------------
+parse_bool() {   # parse_bool VAR DEFAULT -> sets the global named by VAR_VALUE
+    local var="$1" def="$2"
+    if cups_parse_bool "${!var:-}" "${def}"; then
+        printf -v "${var}_VALUE" '%s' "${CUPS_OUT}"
+    else
+        bad "${var}=$(cups_show "${!var}"): ${CUPS_WHY}"
+        printf -v "${var}_VALUE" '%s' "${def}"
+    fi
+}
+parse_bool CUPS_AIRPRINT false
+parse_bool CUPS_WEB_INTERFACE true
+parse_bool CUPS_MANAGED_CONFIG true
+airprint="${CUPS_AIRPRINT_VALUE}"
+web_interface="${CUPS_WEB_INTERFACE_VALUE}"
+managed="${CUPS_MANAGED_CONFIG_VALUE}"
+
+# --- enumerations -------------------------------------------------------------------------------
+log_level=warn
+if [[ -n "${CUPS_LOG_LEVEL:-}" ]]; then
+    if cups_check_log_level "${CUPS_LOG_LEVEL}"; then log_level="${CUPS_OUT}"
+    else bad "CUPS_LOG_LEVEL=$(cups_show "${CUPS_LOG_LEVEL}"): ${CUPS_WHY}"; fi
+fi
+
+paper_size=Letter
+if [[ -n "${CUPS_PAPER_SIZE:-}" ]]; then
+    if cups_check_paper_size "${CUPS_PAPER_SIZE}"; then paper_size="${CUPS_OUT}"
+    else bad "CUPS_PAPER_SIZE=$(cups_show "${CUPS_PAPER_SIZE}"): ${CUPS_WHY}"; fi
+fi
+
+# --- networks -----------------------------------------------------------------------------------
+# parse_networks VAR VALUE ARRAY: space- and/or comma-separated Allow tokens -> normalised,
+# de-duplicated array. Sets need_name_lookups=1 if a host/domain name is used.
+need_name_lookups=0
+parse_networks() {
+    local var="$1" value="$2" t
+    local -n into="$3"
+    local -a toks
+    into=()
+    read -r -a toks <<< "${value//,/ }"
+    if (( ${#toks[@]} == 0 )); then
+        bad "${var} is set but contains no networks"
+        return
+    fi
+    for t in "${toks[@]}"; do
+        if cups_check_allow_token "${t}"; then
+            [[ "${CUPS_KIND}" == name && "${CUPS_OUT}" != localhost ]] && need_name_lookups=1
+            # localhost is always allowed (and listed first); skip duplicates.
+            [[ "${CUPS_OUT}" == localhost ]] && continue
+            [[ " ${into[*]-} " == *" ${CUPS_OUT} "* ]] || into+=("${CUPS_OUT}")
+        else
+            bad "${var}: ${CUPS_WHY}"
+        fi
+    done
+}
+allowed_networks=()
+admin_networks=()
+if [[ -z "${CUPS_ALLOWED_NETWORKS:-}" && -z "${CUPS_ALLOWED_NETWORKS_REJECTED:-}" ]]; then
+    parse_networks CUPS_ALLOWED_NETWORKS "${DEFAULT_NETWORKS}" allowed_networks
+elif [[ -n "${CUPS_ALLOWED_NETWORKS:-}" ]]; then
+    parse_networks CUPS_ALLOWED_NETWORKS "${CUPS_ALLOWED_NETWORKS}" allowed_networks
+fi
+if [[ -n "${CUPS_ADMIN_NETWORKS:-}" ]]; then
+    parse_networks CUPS_ADMIN_NETWORKS "${CUPS_ADMIN_NETWORKS}" admin_networks
+else
+    admin_networks=("${allowed_networks[@]}")
+fi
+
+# --- names --------------------------------------------------------------------------------------
+server_aliases=()
+if [[ -n "${CUPS_SERVER_ALIASES:-}" ]]; then
+    read -r -a _aliases <<< "${CUPS_SERVER_ALIASES//,/ }"
+    for a in "${_aliases[@]}"; do
+        # Never "*": that disables cupsd's Host-header check, which is its DNS-rebinding defence.
+        if cups_valid_dns_name "${a}"; then
+            [[ " ${server_aliases[*]-} " == *" ${a,,} "* ]] || server_aliases+=("${a,,}")
+        else
+            bad "CUPS_SERVER_ALIASES: '${a}' is not a valid host name (wildcards are not allowed)"
+        fi
+    done
+fi
+
+# The name cupsd calls itself (ServerName -> TLS certificate CN) and, in AirPrint mode, the mDNS
+# host name. It must be STABLE: the self-signed certificate is created for it and kept under
+# /config/cups/ssl, and iOS/macOS remember that certificate - a new name means a new certificate
+# and a "credentials changed" prompt. Docker's default hostname is the container ID, which changes
+# on every recreate, so that is replaced by a fixed fallback.
+host_name="${CUPS_FALLBACK_HOSTNAME}"
+host_name_note=""
+container_host="$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname)"
+container_host="${container_host%%.*}"
+if [[ -n "${CUPS_AIRPRINT_HOSTNAME:-}" ]]; then
+    if cups_valid_label "${CUPS_AIRPRINT_HOSTNAME}"; then
+        host_name="${CUPS_AIRPRINT_HOSTNAME}"
+    else
+        bad "CUPS_AIRPRINT_HOSTNAME=$(cups_show "${CUPS_AIRPRINT_HOSTNAME}") is not a single DNS label (letters, digits, inner hyphens, max 63)"
+    fi
+elif cups_looks_like_container_id "${container_host}"; then
+    host_name_note="the container hostname '${container_host}' looks like a Docker container ID (it changes on every recreate); using '${CUPS_FALLBACK_HOSTNAME}' instead - set --hostname=<name> (Extra Parameters) or CUPS_AIRPRINT_HOSTNAME to choose your own"
+elif cups_valid_label "${container_host}"; then
+    host_name="${container_host}"
+else
+    host_name_note="the container hostname '${container_host}' is not usable as a DNS label; using '${CUPS_FALLBACK_HOSTNAME}' instead - set CUPS_AIRPRINT_HOSTNAME"
+fi
+if [[ "${airprint}" == true ]]; then
+    server_name="${host_name}.local"
+else
+    server_name="${host_name}"
+fi
+# The bare name (AirPrint mode) and the container's own hostname are also accepted in Host:
+# headers, so http://unraid-cups:631/ keeps working however the name was chosen.
+for a in "${host_name,,}" "${container_host,,}"; do
+    [[ "${a}" == "${server_name,,}" ]] && continue
+    cups_valid_label "${a}" || continue
+    cups_looks_like_container_id "${a}" && continue
+    [[ " ${server_aliases[*]-} " == *" ${a} "* ]] || server_aliases+=("${a}")
+done
+
+# --- optional queue auto-create -----------------------------------------------------------------
+# All PRINTER_* are ignored unless both PRINTER_NAME and PRINTER_MODEL are set. When they are, the
+# values are validated here, strictly, so a typo stops the container with a clear message instead
+# of failing quietly inside init-cups-queue (which must never block startup on a missing printer).
+queue_wanted=false
+if [[ -n "${PRINTER_NAME:-}" && -n "${PRINTER_MODEL:-}" ]]; then
+    queue_wanted=true
+    cups_valid_queue_name "${PRINTER_NAME}" \
+        || bad "PRINTER_NAME=$(cups_show "${PRINTER_NAME}"): use 1-127 letters, digits, '_', '.' or '-' (no spaces)"
+    cups_valid_model "${PRINTER_MODEL}" \
+        || bad "PRINTER_MODEL=$(cups_show "${PRINTER_MODEL}") is not a driver name as listed by 'lpinfo -m' (or 'everywhere')"
+    if [[ -n "${PRINTER_URI:-}" ]] && ! cups_valid_device_uri "${PRINTER_URI}"; then
+        bad "PRINTER_URI=$(cups_show "$(cups_redact_uri "${PRINTER_URI}")"): expected usb://, socket://, ipp://, ipps://, http:// or https:// with no spaces or quotes"
+    fi
+    cups_valid_text127 "${PRINTER_DESCRIPTION:-}" || bad "PRINTER_DESCRIPTION is longer than 127 characters"
+    cups_valid_text127 "${PRINTER_LOCATION:-}" || bad "PRINTER_LOCATION is longer than 127 characters"
+    if [[ -n "${PRINTER_OPTIONS:-}" ]]; then
+        read -r -a _opts <<< "${PRINTER_OPTIONS}"
+        for o in "${_opts[@]}"; do
+            cups_valid_option "${o}" \
+                || bad "PRINTER_OPTIONS: '${o}' is not a key=value pair (no quotes, backslashes or spaces in values)"
+        done
+    fi
+elif [[ -n "${PRINTER_NAME:-}${PRINTER_MODEL:-}${PRINTER_URI:-}${PRINTER_OPTIONS:-}" ]]; then
+    cups_warn "PRINTER_* is ignored unless both PRINTER_NAME and PRINTER_MODEL are set"
+fi
+
+if (( ${#errors[@]} > 0 )); then
+    cups_err "invalid configuration - refusing to start:"
+    for e in "${errors[@]}"; do
+        printf '**** ERROR:   - %s ****\n' "${e}" >&2
+    done
+    exit 1
+fi
+
+# ================================================================================================
+# 3. /config/cups: seed, migrate, ownership.
+# ================================================================================================
+# cupsd needs its ServerRoot owned root:lp with printers.conf 0600: it runs as root (backends such as
+# usb, PAM authentication) and runs filters as lp. So /config/cups is deliberately NOT handed to
+# PUID/PGID - never `lsiown -R` it. Only /config itself follows PUID/PGID (the base init already
+# does that, non-recursively), so the appdata folder looks normal on the host.
+if [[ -L "${CONFIG_ROOT}" ]]; then
+    cups_err "${CONFIG_ROOT} is a symlink; it must be a real directory on the /config volume. Refusing to start."
+    exit 1
+fi
+first_boot=false
+[[ -d "${CONFIG_ROOT}" ]] || first_boot=true
+mkdir -p "${CONFIG_ROOT}"
+chown root:lp "${CONFIG_ROOT}"
+chmod 0755 "${CONFIG_ROOT}"
+# The same for the two directories whose modes are repaired below: /config is owned by PUID/PGID,
+# so whoever owns it can, while the container is stopped, swap in a /config/cups of their own with
+# ppd/ or ssl/ pointing anywhere. chmod follows symlinks (chown -h does not), and cupsd would keep
+# its TLS keys or PPDs at the link's target. Refuse instead of adopting it.
+for d in ppd ssl; do
+    if [[ -L "${CONFIG_ROOT}/${d}" ]] || { [[ -e "${CONFIG_ROOT}/${d}" ]] && [[ ! -d "${CONFIG_ROOT}/${d}" ]]; }; then
+        cups_err "${CONFIG_ROOT}/${d} is a symlink or not a directory; it must be a real directory on the /config volume. Remove it (CUPS recreates it) and restart. Refusing to start."
+        exit 1
+    fi
+done
+[[ "${first_boot}" == true ]] && cups_log "first run: seeding ${CONFIG_ROOT} from ${SEED_ROOT}"
+
+# Seed every top-level entry the volume does not have yet (ppd/, ssl/, snmp.conf, raw.*, ...).
+# Existing entries are never overwritten, so this is also how a new image adds a new default file.
+for src in "${SEED_ROOT}"/* "${SEED_ROOT}"/.[!.]*; do
+    [[ -e "${src}" || -L "${src}" ]] || continue
+    dst="${CONFIG_ROOT}/${src##*/}"
+    if [[ ! -e "${dst}" && ! -L "${dst}" ]]; then
+        cp -a "${src}" "${dst}"
+    fi
+done
+
+# Migration from the old Unraid CUPS template, which mapped its appdata folder straight onto
+# /etc/cups. Pointing /config at that folder leaves printers.conf and ppd/ at the TOP of /config.
+# Import the queue definitions once - never the old cupsd.conf / cups-files.conf (they carried
+# admin/admin-era settings such as "ServerAlias *" and remote admin from anywhere) and never its
+# ssl/ - and leave every original untouched so going back stays possible.
+migrated_marker="${CONFIG_ROOT}/.imported-from-old-template"
+# --remove-destination (and -L checks): a destination that is a dangling symlink must be replaced,
+# never written through.
+if [[ ! -e "${CONFIG_ROOT}/printers.conf" && ! -L "${CONFIG_ROOT}/printers.conf" ]] \
+   && [[ ! -e "${migrated_marker}" && ! -L "${migrated_marker}" ]] \
+   && [[ -f /config/printers.conf || -d /config/ppd ]]; then
+    cups_log "MIGRATION: found an old CUPS template layout at the top of /config - importing queues"
+    for f in printers.conf classes.conf; do
+        if [[ -f "/config/${f}" && ! -L "/config/${f}" ]]; then
+            cp --remove-destination -- "/config/${f}" "${CONFIG_ROOT}/${f}"
+            chown root:lp "${CONFIG_ROOT}/${f}"
+            chmod 0600 "${CONFIG_ROOT}/${f}"
+            cups_log "MIGRATION: imported /config/${f} -> ${CONFIG_ROOT}/${f}"
+        fi
+    done
+    if [[ -d /config/ppd && ! -L /config/ppd ]]; then
+        mkdir -p "${CONFIG_ROOT}/ppd"
+        while IFS= read -r -d '' p; do
+            cp --remove-destination -- "${p}" "${CONFIG_ROOT}/ppd/${p##*/}"
+            chown root:lp "${CONFIG_ROOT}/ppd/${p##*/}"
+            chmod 0640 "${CONFIG_ROOT}/ppd/${p##*/}"
+            cups_log "MIGRATION: imported ${p} -> ${CONFIG_ROOT}/ppd/${p##*/}"
+        done < <(find /config/ppd -maxdepth 1 -type f -name '*.ppd' -print0)
+    fi
+    for f in cupsd.conf cups-files.conf ssl; do
+        [[ -e "/config/${f}" ]] && cups_log "MIGRATION: NOT imported: /config/${f} (replaced by this image's own; safe to delete once you are happy)"
+    done
+    # A queue whose device URI needs a backend this image does not ship (HPLIP's hp:/, the web UI's
+    # dnssd:// for discovered printers, lpd://, ...) is disabled by cupsd as soon as it loads, and
+    # stays disabled. Say so now; the URI itself is not logged (it may carry credentials).
+    if [[ -f "${CONFIG_ROOT}/printers.conf" ]]; then
+        q=""
+        while read -r key value _; do
+            case "${key}" in
+                "<Printer"|"<DefaultPrinter") q="${value%>}" ;;
+                DeviceURI)
+                    scheme="${value%%:*}"
+                    if [[ ! "${scheme}" =~ ^[a-z][a-z0-9+.-]*$ || ! -f "/usr/lib/cups/backend/${scheme}" ]]; then
+                        cups_warn "MIGRATION: queue $(cups_show "${q}") uses a $(cups_show "${scheme}"): device URI, and this image has no backend for it - CUPS will disable the queue. Give it a usb://, socket:// or ipp:// URI: PRINTER_NAME=$(cups_show "${q}") with PRINTER_MODEL and PRINTER_URI, or Modify Printer in the web UI."
+                    fi ;;
+            esac
+        done < "${CONFIG_ROOT}/printers.conf"
+    fi
+    cups_log "MIGRATION: originals at the top of /config were left untouched"
+    rm -f "${migrated_marker}"
+    date -u '+%Y-%m-%dT%H:%M:%SZ' > "${migrated_marker}"
+fi
+
+# CUPS' own expected ownership on the directories and the files it reads. Targeted and
+# non-recursive by design: no symlink is followed (ppd/ and ssl/ were refused above if they are
+# symlinks; files are found with find -type f, which does not match symlinks; chown -h) and nothing
+# is handed to PUID/PGID. This repairs files dropped in from the host (e.g. by Unraid's "New
+# Permissions" tool).
+mkdir -p "${CONFIG_ROOT}/ppd" "${CONFIG_ROOT}/ssl"
+chown -h root:lp "${CONFIG_ROOT}/ppd" "${CONFIG_ROOT}/ssl"
+chmod 0755 "${CONFIG_ROOT}/ppd"
+chmod 0700 "${CONFIG_ROOT}/ssl"
+# TLS private keys: root-only, whatever umask created them or a host tool did to them since. The
+# directory mode above is otherwise their only protection, and it lives on a host-visible volume.
+while IFS= read -r -d '' f; do
+    chown -h root:root "${f}"
+    chmod 0600 "${f}"
+done < <(find "${CONFIG_ROOT}/ssl" -maxdepth 1 -type f \( -name '*.key' -o -name '*.key.replaced' \) -print0)
+while IFS= read -r -d '' f; do
+    chown -h root:lp "${f}"
+    case "${f##*/}" in
+        printers.conf|printers.conf.O|classes.conf|classes.conf.O) chmod 0600 "${f}" ;;
+    esac
+done < <(find "${CONFIG_ROOT}" -maxdepth 1 -type f \
+              \( -name 'printers.conf*' -o -name 'classes.conf*' -o -name 'subscriptions.conf*' \) -print0)
+while IFS= read -r -d '' f; do
+    chown -h root:lp "${f}"
+    chmod 0640 "${f}"   # what cupsd itself uses; filters read it as group lp
+done < <(find "${CONFIG_ROOT}/ppd" -maxdepth 1 -type f -name '*.ppd' -print0)
+
+# ================================================================================================
+# 4. Admin account (web UI /admin and IPP administration).
+# ================================================================================================
+# Created as a no-login system account in lpadmin (cupsd's SystemGroup) and authenticated by cupsd
+# through PAM. The password is (re)applied on every boot, so changing it in the template and
+# restarting takes effect. It is never printed, never passed on a command line (printf is a bash
+# builtin; chpasswd reads stdin), and never inherited by the long-running daemons.
+admin_user="${CUPS_ADMIN_USER:-}"
+admin_pass="${CUPS_ADMIN_PASSWORD:-}"
+# FILE__CUPS_ADMIN_PASSWORD secrets usually end with a newline; strip trailing CR/LF only.
+while [[ "${admin_pass}" == *$'\n' || "${admin_pass}" == *$'\r' ]]; do
+    admin_pass="${admin_pass%?}"
+done
+admin_enabled=false
+admin_problem=""
+if [[ -z "${admin_user}" && -z "${admin_pass}" ]]; then
+    admin_problem="not configured"
+elif [[ -z "${admin_user}" || -z "${admin_pass}" ]]; then
+    admin_problem="both CUPS_ADMIN_USER and CUPS_ADMIN_PASSWORD are needed"
+    cups_warn "admin: ${admin_problem} - remote administration stays DISABLED"
+elif ! cups_valid_user_name "${admin_user}"; then
+    admin_problem="invalid CUPS_ADMIN_USER"
+    cups_err "admin: CUPS_ADMIN_USER=$(cups_show "${admin_user}") is not a valid user name (lower-case letters, digits, '_', '-'; max 31) - treating it as unset, remote administration stays DISABLED"
+elif [[ " root lp lpadmin abc nobody daemon " == *" ${admin_user} "* ]] \
+     || { getent passwd "${admin_user}" > /dev/null \
+          && [[ "$(getent passwd "${admin_user}" | cut -d: -f5)" != "${CUPS_ADMIN_GECOS}" ]]; }; then
+    # Any account that exists but was not created by this image (root, lp, abc, nobody, daemon,
+    # messagebus, avahi, ...) is reserved: giving it a password and admin rights would be a quiet
+    # privilege change to an account something else relies on.
+    admin_problem="reserved user name"
+    cups_err "admin: CUPS_ADMIN_USER='${admin_user}' is a reserved/system account name - pick another name (e.g. printadmin). Treating it as unset; remote administration stays DISABLED"
+elif cups_has_ctrl "${admin_pass}"; then
+    admin_problem="invalid CUPS_ADMIN_PASSWORD"
+    cups_err "admin: CUPS_ADMIN_PASSWORD contains a control character (newline, tab, ...) - treating it as unset; remote administration stays DISABLED"
+else
+    admin_enabled=true
+fi
+
+# Remove accounts this image created on an earlier boot that are no longer wanted (admin disabled,
+# or CUPS_ADMIN_USER renamed). /etc/passwd lives in the container layer, so this matters for
+# `docker restart`; a recreate starts clean anyway.
+while IFS=: read -r name _ _ _ gecos _; do
+    [[ "${gecos}" == "${CUPS_ADMIN_GECOS}" ]] || continue
+    [[ "${admin_enabled}" == true && "${name}" == "${admin_user}" ]] && continue
+    if userdel "${name}" 2>/dev/null; then
+        cups_log "admin: removed previous admin account '${name}'"
+    fi
+done < <(getent passwd)
+
+if [[ "${admin_enabled}" == true ]]; then
+    if ! getent passwd "${admin_user}" > /dev/null; then
+        useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin \
+                --no-user-group --gid lpadmin --comment "${CUPS_ADMIN_GECOS}" "${admin_user}"
+    fi
+    if ! printf '%s:%s\n' "${admin_user}" "${admin_pass}" | chpasswd 2>/dev/null; then
+        cups_err "admin: could not set the password for '${admin_user}' - remote administration stays DISABLED"
+        userdel "${admin_user}" 2>/dev/null || true
+        admin_enabled=false
+        admin_problem="chpasswd failed"
+    else
+        [[ ${#admin_pass} -lt 12 ]] && cups_warn "admin: CUPS_ADMIN_PASSWORD is shorter than 12 characters - use a long random password"
+    fi
+fi
+unset admin_pass CUPS_ADMIN_PASSWORD
+
+# A FILE__CUPS_ADMIN_PASSWORD secret is bind-mounted with the HOST file's mode - typically 0644
+# for a compose file-based secret, 0444 for a swarm one. Then the print filters, which run as lp on
+# untrusted documents, can read the admin password straight from it, whatever this image does with
+# its own copies. It is the user's file, so it is not chmod'ed here; the log says what to fix.
+if [[ "${admin_enabled}" == true && -n "${FILE__CUPS_ADMIN_PASSWORD:-}" && -f "${FILE__CUPS_ADMIN_PASSWORD}" ]] \
+   && s6-setuidgid lp test -r "${FILE__CUPS_ADMIN_PASSWORD}" 2>/dev/null; then
+    cups_warn "admin: the FILE__CUPS_ADMIN_PASSWORD file $(cups_show "${FILE__CUPS_ADMIN_PASSWORD}") is readable by the unprivileged 'lp' user that runs the print filters (mode $(stat -L -c '%a, owner uid %u' -- "${FILE__CUPS_ADMIN_PASSWORD}")) - make it root-owned and 0600 (or 0400) on the host"
+fi
+
+# s6-overlay stores the container environment as world-readable files. Print filters run as lp
+# and process untrusted documents; they have no business reading the admin password, so narrow the
+# file to root (with-contenv, which reads it, runs as root).
+for f in /run/s6/container_environment/CUPS_ADMIN_PASSWORD \
+         /run/s6/container_environment/FILE__CUPS_ADMIN_PASSWORD; do
+    [[ -f "${f}" ]] && chmod 0600 "${f}"
+done
+
+# ================================================================================================
+# 5. cupsd.conf / cups-files.conf
+# ================================================================================================
+# shellcheck disable=SC2317,SC2329 # invoked indirectly, through write_conf
+render_cupsd_conf() {
+    local n
+    cat <<EOF
+# cupsd.conf - GENERATED by docker-cups on every container start; edits here are LOST on restart.
+#
+# Change settings through the container's environment (CUPS_* variables) instead. If you really
+# need a hand-edited file, set CUPS_MANAGED_CONFIG=false: this file is then written once and left
+# alone, and you own its security settings from then on.
+#
+# Operation policies at the bottom are copied verbatim from Ubuntu's cupsd.conf.default.
+
+LogLevel ${log_level}
+PageLogFormat
+MaxLogSize 0
+ErrorPolicy retry-job
+
+# Write printers.conf & co. to /config as soon as they change, not up to 30 s later: a container
+# that is killed (docker rm -f, a forced stop, a host crash) must not silently lose a new queue.
+DirtyCleanInterval 0
+
+# All interfaces: printing from the LAN is the point. WHO may connect is decided by the <Location>
+# blocks below, not by the listen address.
+Listen /run/cups/cups.sock
+Port 631
+
+# Stable name: the name cupsd answers to, and (with the container's own names symlinked to it in
+# /config/cups/ssl) the name of its one self-signed TLS certificate. Host: headers are checked
+# against it (plus aliases, localhost, numeric addresses and *.local) - the DNS-rebinding defence,
+# which is why a wildcard alias is never written.
+ServerName ${server_name}
+EOF
+    for n in "${server_aliases[@]}"; do printf 'ServerAlias %s\n' "${n}"; done
+    cat <<EOF
+ServerTokens None
+EOF
+    if (( need_name_lookups )); then
+        cat <<'EOF'
+# A host/domain name is used in an Allow list; those only match after a reverse lookup, and
+# "Double" also checks that the name resolves back to the client's address.
+HostNameLookups Double
+EOF
+    fi
+    cat <<EOF
+
+DefaultPaperSize ${paper_size}
+WebInterface $([[ "${web_interface}" == true ]] && echo Yes || echo No)
+
+# DNS-SD (AirPrint/IPP Everywhere) publishing through the in-container avahi-daemon.
+Browsing $([[ "${airprint}" == true ]] && echo Yes || echo No)
+BrowseLocalProtocols $([[ "${airprint}" == true ]] && echo dnssd || echo none)
+
+# Queues are shared by default: remote printing needs a shared queue, with or without mDNS.
+DefaultShared Yes
+
+# Authentication is HTTP Basic against the container's PAM. A 401 challenge to a non-local,
+# unencrypted client becomes "426 Upgrade Required" (redirect to https), so no client is ever ASKED
+# for a password over plain http. /admin and every password-protected IPP operation (see the
+# policies at the bottom) refuse plain http outright. What cupsd cannot refuse: credentials a client
+# sends unasked over http to another page (a web-UI printer page, say) - use https:// / ipps://.
+DefaultAuthType Basic
+DefaultEncryption Required
+
+# Who may print and browse.
+<Location />
+  Order allow,deny
+  Allow localhost
+EOF
+    for n in "${allowed_networks[@]}"; do printf '  Allow %s\n' "${n}"; done
+    printf '</Location>\n'
+    local loc
+    for loc in /admin /admin/conf /admin/log; do
+        cat <<EOF
+
+# Administration: an @SYSTEM (lpadmin) user, over TLS, from $( [[ "${admin_enabled}" == true ]] && echo "CUPS_ADMIN_NETWORKS" || echo "localhost only (no CUPS_ADMIN_USER/CUPS_ADMIN_PASSWORD configured)").
+<Location ${loc}>
+  AuthType Default
+  Require user @SYSTEM
+  Encryption Required
+  Order allow,deny
+  Allow localhost
+EOF
+        if [[ "${admin_enabled}" == true ]]; then
+            for n in "${admin_networks[@]}"; do printf '  Allow %s\n' "${n}"; done
+        fi
+        printf '</Location>\n'
+    done
+    printf '\n'
+    cat <<'EOF'
+# Operation policies: Ubuntu's, verbatim, plus one line - "Encryption Required" under every
+# "AuthType Default/Basic" (the operations that take a password: administration, and printing on
+# queues set to the "authenticated" policy). DefaultEncryption only turns a 401 CHALLENGE into a
+# 426; a client that sends its credentials unasked over plain http would otherwise still have the
+# password accepted for, e.g., CUPS-Add-Modify-Printer on /printers/NAME.
+EOF
+    awk '
+        /^[ \t]*<Limit[ \t>]/  { inlimit = 1 }
+        /^[ \t]*<\/Limit>/      { inlimit = 0 }
+        { print }
+        inlimit && $1 == "AuthType" && ($2 == "Default" || $2 == "Basic") {
+            match($0, /^[ \t]*/)
+            printf "%sEncryption Required\n", substr($0, 1, RLENGTH)
+            n++
+        }
+        END { if (n == 0) exit 3 }
+    ' "${POLICIES}" || { cups_err "${POLICIES}: no password-protected <Limit> found - the policy layout changed; refusing to write a cupsd.conf without them"; return 1; }
+}
+
+# shellcheck disable=SC2317,SC2329 # invoked indirectly, through write_conf
+render_cups_files_conf() {
+    cat <<'EOF'
+# cups-files.conf - GENERATED by docker-cups on every container start; edits here are LOST on
+# restart (unless CUPS_MANAGED_CONFIG=false, in which case it is written once and left alone).
+
+# Admin group. root is listed too: the @SYSTEM check has no root bypass, and without it
+# `docker exec <container> lpadmin ...` (root over the local socket) would be refused.
+SystemGroup lpadmin root
+
+# Logs go to the container log (docker logs), not to files inside the container.
+AccessLog stderr
+ErrorLog stderr
+PageLog stderr
+
+# Never let a queue write to arbitrary files (file:/ device URIs).
+FileDevice No
+
+# Self-signed certificate + key, created on first TLS use for ServerName, kept on the /config
+# volume so clients see the same certificate after a recreate. (CreateSelfSignedCerts defaults to
+# yes; Sandboxing keeps its compiled-in "strict" default.)
+ServerKeychain ssl
+EOF
+}
+
+write_conf() {   # write_conf NAME RENDER_FN
+    local dst="${CONFIG_ROOT}/$1" tmp
+    tmp="$(mktemp "${CONFIG_ROOT}/.$1.XXXXXX")"
+    "$2" > "${tmp}"
+    chown root:lp "${tmp}"
+    chmod 0640 "${tmp}"
+    mv -f "${tmp}" "${dst}"
+}
+
+if [[ "${managed}" == true ]]; then
+    write_conf cupsd.conf render_cupsd_conf
+    write_conf cups-files.conf render_cups_files_conf
+else
+    for f in cupsd.conf cups-files.conf; do
+        if [[ ! -e "${CONFIG_ROOT}/${f}" ]]; then
+            write_conf "${f}" "render_${f//[-.]/_}"
+            cups_log "CUPS_MANAGED_CONFIG=false: seeded ${CONFIG_ROOT}/${f} once from the current settings"
+        fi
+    done
+    cups_warn "CUPS_MANAGED_CONFIG=false: ${CONFIG_ROOT}/cupsd.conf and cups-files.conf are NOT regenerated."
+    cups_warn "CUPS_ALLOWED_NETWORKS, CUPS_ADMIN_NETWORKS, CUPS_SERVER_ALIASES, CUPS_LOG_LEVEL, CUPS_PAPER_SIZE, CUPS_WEB_INTERFACE, the cupsd side of CUPS_AIRPRINT/CUPS_AIRPRINT_HOSTNAME (Browsing, BrowseLocalProtocols, ServerName) and the TLS/admin restrictions are NO LONGER ENFORCED by this image - you own those files' security settings."
+fi
+
+# What cupsd will actually do. Managed: what was just written. Unmanaged: whatever the user's file
+# says (last top-level occurrence wins, as in cupsd; absent = cupsd's compiled-in default), so the
+# posture summary below never claims something the file does not do.
+conf_value() {   # conf_value DIRECTIVE -> its value in cupsd.conf, or empty
+    awk -v d="${1,,}" 'tolower($1) == d { $1 = ""; sub(/^[ \t]+/, ""); v = $0 } END { print v }' \
+        "${CONFIG_ROOT}/cupsd.conf" 2>/dev/null || true
+}
+eff_server_name="${server_name}"
+airprint_note=""
+if [[ "${managed}" != true ]]; then
+    eff_server_name="$(conf_value ServerName)"
+    eff_browsing="$(conf_value Browsing)"
+    eff_protocols="$(conf_value BrowseLocalProtocols)"
+    if [[ "${airprint}" == true ]] \
+       && { [[ ! "${eff_browsing,,}" =~ ^(yes|on|true)$ ]] || [[ " ${eff_protocols,,} " != *" dnssd "* ]]; }; then
+        airprint_note="requested, but the unmanaged cupsd.conf has Browsing ${eff_browsing:-(unset)} / BrowseLocalProtocols ${eff_protocols:-(unset)} - NOTHING is advertised"
+        cups_warn "CUPS_AIRPRINT=true starts D-Bus and Avahi, but the unmanaged ${CONFIG_ROOT}/cupsd.conf has Browsing ${eff_browsing:-(unset)} and BrowseLocalProtocols ${eff_protocols:-(unset)}: cupsd will not advertise anything until you set 'Browsing Yes' and 'BrowseLocalProtocols dnssd' there yourself"
+    fi
+fi
+
+# ================================================================================================
+# 6. TLS identity: one self-signed certificate for every name cupsd may present.
+# ================================================================================================
+# cupsd (GnuTLS) does NOT name its certificate after ServerName. For a connection to a non-local
+# address it reverse-resolves the address the client connected TO - in Docker, /etc/hosts maps that
+# to the container hostname, i.e. the random container ID unless --hostname is set - and uses
+# ssl/<that name>.crt/.key, creating them on first use. Only a localhost connection (or a looked-up
+# name starting with a digit) falls back to ServerName. Left alone, every recreate without
+# --hostname mints a new certificate (iOS: "credentials changed"), CUPS_AIRPRINT_HOSTNAME never
+# becomes the CN, and one container even serves two certificates (one on its IP, one on localhost).
+#
+# So: ONE certificate, ssl/<stable name>.crt/.key, created here once the way cupsd would (RSA-2048,
+# SHA-256, 10 years, CN = the name), and every other name cupsd may look up - ServerName and the
+# reverse-lookup name of each container address - is a relative symlink to it. A certificate cupsd
+# made earlier under one of those names is kept as <file>.replaced, and is restored if that name
+# becomes the stable one again. Not a security boundary: if anything here fails, cupsd simply
+# creates its own certificates as before, so problems are warnings.
+ssl_dir="${CONFIG_ROOT}/ssl"
+tls_cn="${host_name}"
+
+tls_identity() {
+    local ext p n ip name target
+    local -a names=() addrs=()
+    for ext in crt key; do
+        p="${ssl_dir}/${tls_cn}.${ext}"
+        if [[ -L "${p}" ]]; then
+            rm -f "${p}"
+            if [[ -f "${p}.replaced" && ! -L "${p}.replaced" ]]; then mv -f "${p}.replaced" "${p}"; fi
+        fi
+    done
+    if [[ ! -f "${ssl_dir}/${tls_cn}.crt" || ! -f "${ssl_dir}/${tls_cn}.key" ]]; then
+        rm -f "${ssl_dir}/${tls_cn}.crt" "${ssl_dir}/${tls_cn}.key"   # half a pair is useless
+        if ! ( umask 077
+               openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+                   -keyout "${ssl_dir}/${tls_cn}.key" -out "${ssl_dir}/${tls_cn}.crt" \
+                   -subj "/CN=${tls_cn}/O=${tls_cn}" \
+                   -addext "subjectAltName=DNS:${tls_cn},DNS:${tls_cn}.local,DNS:localhost" \
+                   -addext "basicConstraints=critical,CA:FALSE" \
+                   -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+                   -addext "extendedKeyUsage=serverAuth" ) > /dev/null 2>&1; then
+            rm -f "${ssl_dir}/${tls_cn}.crt" "${ssl_dir}/${tls_cn}.key"
+            cups_warn "TLS: could not create a certificate for '${tls_cn}' - cupsd will create its own on first use"
+            return 0
+        fi
+        chmod 0644 "${ssl_dir}/${tls_cn}.crt"
+        cups_log "TLS: created the self-signed certificate for '${tls_cn}' (valid 10 years, kept in ${ssl_dir})"
+    fi
+
+    # Every name cupsd may look the certificate up by. Only plain DNS names: anything else maps to
+    # a different file name in cupsd (and is rare enough to leave to cupsd).
+    add_name() {
+        [[ -n "$1" && "$1" != "${tls_cn}" && "${1,,}" != localhost ]] || return 0
+        cups_valid_dns_name "$1" || return 0
+        [[ "$1" == [0-9]* ]] && return 0                       # cupsd treats it as numeric
+        [[ " ${names[*]-} " == *" $1 "* ]] || names+=("$1")
+    }
+    add_name "${eff_server_name}"
+    read -r -a addrs <<< "$(hostname -I 2>/dev/null || true)"
+    for ip in "${addrs[@]}"; do
+        name="$(timeout 5 getent hosts "${ip}" 2>/dev/null || true)"
+        read -r _ name _ <<< "${name}"
+        add_name "${name:-}"
+    done
+
+    for n in "${names[@]}"; do
+        for ext in crt key; do
+            p="${ssl_dir}/${n}.${ext}"
+            if [[ -L "${p}" ]]; then
+                [[ "$(readlink "${p}")" == "${tls_cn}.${ext}" ]] && continue
+                rm -f "${p}"
+            elif [[ -e "${p}" ]]; then
+                mv -f "${p}" "${p}.replaced"
+                cups_log "TLS: '${n}' now uses the '${tls_cn}' certificate (its own kept as ${p##*/}.replaced)"
+            fi
+            ln -s "${tls_cn}.${ext}" "${p}"
+        done
+    done
+    # Links for names that no longer apply (an old container ID, a renamed host) go; only links of
+    # the shape created above are touched, never a regular file.
+    while IFS= read -r -d '' p; do
+        n="${p##*/}"; n="${n%.*}"
+        [[ " ${names[*]-} " == *" ${n} "* ]] && continue
+        target="$(readlink "${p}")"
+        [[ "${target}" =~ ^[A-Za-z0-9.-]+\.(crt|key)$ ]] && rm -f "${p}"
+    done < <(find "${ssl_dir}" -maxdepth 1 -type l \( -name '*.crt' -o -name '*.key' \) -print0)
+    return 0
+}
+tls_identity
+
+# ================================================================================================
+# 7. AirPrint (DNS-SD) runtime: avahi config + stale pid files.
+# ================================================================================================
+# s6-overlay does not wipe /run on `docker restart`, so pid files from the previous run survive and
+# would make the daemons think they are already running (the pid may even belong to something
+# else now). Safe to delete only because the host-D-Bus guard above has already passed.
+mkdir -p /run/cups
+chown root:lp /run/cups
+chmod 0755 /run/cups
+rm -f /run/dbus/pid /run/avahi-daemon/pid
+
+if [[ "${airprint}" == true ]]; then
+    # host-name: a distinctive name, because cupsd caches avahi's host name (the SRV target of every
+    # printer it publishes) on first contact and never refreshes it - if avahi later renamed itself
+    # after a collision ("cups" -> "cups-2"), the published records would point at another machine.
+    # use-ipv6=no: IPv6 link-local mDNS through macvlan/ipvlan is a common source of duplicate,
+    # unreachable records; clients find the printer over IPv4.
+    # publish-workstation/hinfo=no: advertise printers only, not the container.
+    # disallow-other-stacks=yes: refuse to share UDP 5353 with another mDNS stack (e.g. the host's,
+    # if someone runs this with host networking) instead of silently half-working.
+    # allow-interfaces is left unset: inside the container's own network namespace every interface
+    # is the one the user attached (br0 / eth0 / bond0 ...).
+    cat > /etc/avahi/avahi-daemon.conf <<EOF
+# GENERATED by docker-cups (init-cups-config) on every container start.
+[server]
+host-name=${host_name}
+use-ipv4=yes
+use-ipv6=no
+ratelimit-interval-usec=1000000
+ratelimit-burst=1000
+disallow-other-stacks=yes
+
+[wide-area]
+enable-wide-area=no
+
+[publish]
+publish-hinfo=no
+publish-workstation=no
+
+[reflector]
+enable-reflector=no
+
+[rlimits]
+EOF
+    chmod 0644 /etc/avahi/avahi-daemon.conf
+fi
+
+# ================================================================================================
+# 8. Security posture summary.
+# ================================================================================================
+join() { local IFS=' '; printf '%s' "$*"; }
+# The fallback name only really matters for AirPrint (it is what iPhones will show and remember);
+# otherwise it is just the certificate's name, so say it quietly.
+if [[ -n "${host_name_note}" ]]; then
+    if [[ "${airprint}" == true ]]; then cups_warn "${host_name_note}"; else cups_log "note: ${host_name_note}"; fi
+fi
+cups_log "docker-cups security posture"
+{
+    printf '      listening       : TCP 631 on all interfaces (IPP, IPPS, web UI) + /run/cups/cups.sock\n'
+    if [[ "${managed}" == true ]]; then
+        printf '      server name     : %s%s\n' "${server_name}" \
+            "$( (( ${#server_aliases[@]} )) && printf ' (also: %s)' "$(join "${server_aliases[@]}")")"
+    else
+        printf '      server name     : %s (from the unmanaged cupsd.conf)\n' "${eff_server_name:-(unset: the container hostname)}"
+    fi
+    printf '      TLS certificate : %s/%s.crt%s\n' "${ssl_dir}" "${tls_cn}" \
+        "$([[ -f "${ssl_dir}/${tls_cn}.crt" ]] && printf ' (SHA-256 %s)' "$(openssl x509 -in "${ssl_dir}/${tls_cn}.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//')")"
+    if [[ "${managed}" == true ]]; then
+        printf '      may print       : localhost %s\n' "$(join "${allowed_networks[@]}")"
+        if [[ "${admin_enabled}" == true ]]; then
+            printf "      admin (/admin)  : user '%s' (password set), TLS required, from localhost %s\n" \
+                "${admin_user}" "$(join "${admin_networks[@]}")"
+        else
+            printf '      admin (/admin)  : localhost only (%s; use docker exec <container> lpadmin ...)\n' "${admin_problem}"
+        fi
+        printf '      web interface   : %s\n' "$([[ "${web_interface}" == true ]] && echo on || echo off)"
+        (( need_name_lookups )) && printf '      host names      : reverse-DNS lookups enabled (HostNameLookups Double) for name-based Allow rules\n'
+    else
+        printf '      access control  : UNMANAGED (CUPS_MANAGED_CONFIG=false) - see %s/cupsd.conf\n' "${CONFIG_ROOT}"
+        if [[ "${admin_enabled}" == true ]]; then
+            printf "      admin account   : '%s' (password set)\n" "${admin_user}"
+        fi
+    fi
+    if [[ "${airprint}" == true && -n "${airprint_note}" ]]; then
+        printf '      AirPrint/DNS-SD : %s\n' "${airprint_note}"
+    elif [[ "${airprint}" == true ]]; then
+        printf '      AirPrint/DNS-SD : ON - advertising shared queues as %s.local via in-container avahi\n' "${host_name}"
+    else
+        printf '      AirPrint/DNS-SD : off\n'
+    fi
+    printf '      file: devices   : disabled; cups-browsed: not installed\n'
+    printf '      paper / log     : %s / %s\n' "${paper_size}" "${log_level}"
+    printf '      queue auto-add  : %s\n' "$([[ "${queue_wanted}" == true ]] && printf '%s (%s)' "${PRINTER_NAME}" "${PRINTER_MODEL}" || echo off)"
+}
+
+exit 0
