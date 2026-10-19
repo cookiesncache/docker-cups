@@ -19,12 +19,21 @@
 # anything, so it must run before anything else touches /run/dbus or /run/avahi-daemon (stale
 # pid/socket cleanup included).
 #
-# Called by init-cups-config (which then fails the container start) and again by svc-dbus.
+# Called by init-cups-config (which then fails the container start) and again by svc-dbus, with
+# --system-bus-only: when svc-dbus (re)starts, our own avahi-daemon may still be on its way out
+# (it exits when the bus goes away), so its socket is not evidence of anything there.
 
 set -euo pipefail
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=../lib/docker-cups/common.sh
 source /usr/local/lib/docker-cups/common.sh
+
+live_scope=all
+case "${1:-}" in
+    "") ;;
+    --system-bus-only) live_scope=system-bus ;;
+    *) printf 'usage: cups-dbus-guard [--system-bus-only]\n' >&2; exit 2 ;;
+esac
 
 list() {   # list <lines> -> one indented ERROR line each
     local m
@@ -60,7 +69,7 @@ if found="$(cups_foreign_run_mounts)"; then
     refuse
 fi
 
-if found="$(cups_live_foreign_sockets)"; then
+if found="$(cups_live_foreign_sockets "${live_scope}")"; then
     cups_err "a host D-Bus directory/socket is mounted into this container - something outside it is already serving:"
     list "${found}"
     cups_err "most likely the host's /run or /var/run is mapped into the container; remove that path mapping from the container template."

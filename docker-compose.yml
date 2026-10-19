@@ -49,6 +49,8 @@ services:
     device_cgroup_rules:
       - 'c 189:* rmw'
     ports:
-      # LAN only - never forward 631 from the internet.
+      # LAN only - never forward 631 from the internet. On a dual-stack host whose IPv6 address is
+      # reachable from outside, publish on IPv4 only (0.0.0.0:631:631): Docker relays IPv6
+      # connections from its bridge gateway, which the default allow list admits (README, Security).
       - 631:631
     restart: unless-stopped

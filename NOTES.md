@@ -252,15 +252,17 @@ host's system bus. Three read-only checks; any hit refuses to start, deleting no
    directory there. A default container has no mount at `/run`, and the `--read-only` recipe uses
    `--tmpfs /run`, which passes;
 3. a `system_bus_socket` or Avahi socket that **accepts** a connection (`s6-ipcclient … true`). The
-   host's own `/run` is a tmpfs, so a bind of it passes check 2; but our daemons are never running
-   when the guard runs (`init-cups-config` precedes them; `svc-dbus` runs it only after its previous
-   dbus-daemon exited), so a live bus can only be someone else's.
+   host's own `/run` is a tmpfs, so a bind of it passes check 2; but our own daemon for a socket is
+   never running when the guard checks it, so a live one can only be someone else's.
+   `init-cups-config` precedes both daemons and checks both sockets. `svc-dbus` runs only after its
+   previous dbus-daemon exited, but our avahi-daemon may still be on its way out then (it exits when
+   the bus goes away, and s6 keeps retrying it while the bus is down), so `svc-dbus` calls the guard
+   with `--system-bus-only`.
 
 Checks 2 and 3 came out of review: a bind of the host's `/run` hid the bus below a mount the first
 check never looked at, and the container then replaced the host's live bus socket with its own.
-Runs first in `init-cups-config` and again in `svc-dbus`. Verified after `pkill -KILL dbus-daemon`:
-the restarted `svc-dbus` passes the guard (avahi exits with the bus, so its socket is dead too) and
-DNS-SD comes back.
+Runs first in `init-cups-config` and again in `svc-dbus`. Verified after repeated
+`pkill -KILL dbus-daemon`: the restarted `svc-dbus` passes the guard and DNS-SD comes back.
 
 ## Generated configuration
 
@@ -360,10 +362,12 @@ collected and printed together, values `%q`-escaped so an injected newline canno
 - Allow tokens: `@LOCAL`, `@IF(name)`, IPv4 `a.b.c.d[/1-32]` (no leading zeros, no partial
   shorthands, no dotted netmasks), IPv6 `[addr][/1-128]` (RFC 4291 forms), `localhost`, host names,
   `*.domain` / `.domain`. Refused: `all`, `none`, `*`, `any`, `everyone`, `/0`, names starting with a
-  digit (cupsd would parse them as addresses), and IPv6 networks that contain `::/96` (`[::]/1` …
-  `[::]/96`, `[::]/64`): cupsd stores every IPv4 client and IPv4 mask as the IPv4-compatible address
-  `::a.b.c.d`, so such a token — IPv6-looking in `cupsd.conf` and in the log — admits every IPv4
-  client (verified: `[::]/1` let an IPv4 peer in). Tokens are normalised and de-duplicated;
+  digit (cupsd would parse them as addresses), and IPv6 networks that overlap `::/96`: cupsd stores
+  every IPv4 client and IPv4 mask as the IPv4-compatible address `::a.b.c.d`, so such a token —
+  IPv6-looking in `cupsd.conf` and in the log — admits IPv4 clients: every one of them for `[::]/1` …
+  `[::]/96` (verified: `[::]/1` let an IPv4 peer in), a slice of the IPv4 internet for a longer
+  prefix (`[::]/97` is `0.0.0.0/1`, public addresses included). A single address (`[::1]`, `/128`)
+  can match at most one IPv4 client and is accepted. Tokens are normalised and de-duplicated;
   `localhost` is always first.
 - `CUPS_SERVER_ALIASES`: dotted DNS names; `*` refused (it disables the Host-header check, which is
   cupsd's DNS-rebinding defence).

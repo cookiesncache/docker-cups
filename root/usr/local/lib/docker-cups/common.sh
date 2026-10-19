@@ -158,8 +158,10 @@ cups_looks_like_container_id() { [[ "$1" =~ ^[0-9a-f]{12}$ ]]; }
 # Refused: all / none / * / any /0 prefix (each means "everyone" or "no-one", which is never what a
 # LAN print server wants), CUPS' partial-address shorthands ("10", "192.168"), dotted netmasks,
 # names starting with a digit (cupsd would try to parse those as addresses), and IPv6 networks that
-# contain ::/96 ([::]/1 ... [::]/96): cupsd stores every IPv4 client as the IPv4-compatible address
-# ::a.b.c.d, so such a token - IPv6-looking in cupsd.conf and in the log - admits EVERY IPv4 client.
+# overlap ::/96: cupsd stores every IPv4 client as the IPv4-compatible address ::a.b.c.d, so such a
+# token - IPv6-looking in cupsd.conf and in the log - admits IPv4 clients: all of them for [::]/1 ...
+# [::]/96, a slice of the IPv4 internet for [::]/97 ... [::]/127 ([::]/97 is 0.0.0.0/1). A single
+# address ([::1], /128) can match at most one IPv4 client and is left alone.
 CUPS_KIND=""
 cups_check_allow_token() {
     local t="$1" addr len
@@ -186,8 +188,15 @@ cups_check_allow_token() {
             if [[ -n "${len}" ]] && { [[ "${len}" =~ ^0[0-9] ]] || (( 10#${len} < 1 || 10#${len} > 128 )); }; then
                 CUPS_WHY="'${t}': IPv6 prefix length must be 1-128"; return 1
             fi
-            if [[ -n "${len}" ]] && (( 10#${len} <= 96 )) && _cups_ipv6_zero_prefix "${addr}" "$((10#${len}))"; then
-                CUPS_WHY="'${t}' also matches every IPv4 client (cupsd keeps IPv4 addresses as ::a.b.c.d inside this range) - list IPv4 networks explicitly instead"
+            # A network (not a single address) whose first min(len, 96) bits are zero overlaps
+            # ::/96, where cupsd keeps IPv4 clients.
+            if [[ -n "${len}" ]] && (( 10#${len} < 128 )) \
+               && _cups_ipv6_zero_prefix "${addr}" "$(( 10#${len} < 96 ? 10#${len} : 96 ))"; then
+                if (( 10#${len} <= 96 )); then
+                    CUPS_WHY="'${t}' also matches every IPv4 client (cupsd keeps IPv4 addresses as ::a.b.c.d inside this range) - list IPv4 networks explicitly instead"
+                else
+                    CUPS_WHY="'${t}' also matches IPv4 clients (cupsd keeps IPv4 addresses as ::a.b.c.d, which this range overlaps) - write IPv4 networks as a.b.c.d/len instead"
+                fi
                 return 1
             fi
             CUPS_OUT="[${addr,,}]${len:+/$((10#${len}))}"; CUPS_KIND=ip; return 0
@@ -339,17 +348,22 @@ cups_foreign_run_mounts() {
 }
 
 # The host's /run bind-mounted at /run (or /var/run) is itself a tmpfs, so the check above cannot
-# tell it from `--tmpfs /run`. What gives it away is a LIVE bus: our own dbus-daemon and
-# avahi-daemon are not running whenever this is called (init-cups-config runs before them;
-# svc-dbus runs it only after its previous dbus-daemon has exited), so a socket at the system-bus
-# or Avahi path that ACCEPTS a connection belongs to someone else. s6-ipcclient connects and runs
+# tell it from `--tmpfs /run`. What gives it away is a LIVE bus: a socket at the system-bus or Avahi
+# path that ACCEPTS a connection while our own daemon for it is not running belongs to someone else.
+# init-cups-config runs before both of ours, so it checks both paths. svc-dbus passes "system-bus":
+# s6 restarts it only after its previous dbus-daemon has exited, but our avahi-daemon may still be
+# shutting down at that moment (it exits when the bus goes away, and s6 keeps retrying it while the
+# bus is down), so only the system-bus socket is evidence there. s6-ipcclient connects and runs
 # `true`, i.e. hangs up at once without saying anything. Prints the live socket paths.
-cups_live_foreign_sockets() {
+cups_live_foreign_sockets() {   # cups_live_foreign_sockets [system-bus]
     local found=1 sock
-    local -a socks=(/run/dbus/system_bus_socket /run/avahi-daemon/socket)
+    local -a socks=(/run/dbus/system_bus_socket)
+    [[ "${1:-}" == system-bus ]] || socks+=(/run/avahi-daemon/socket)
     # /var/run is normally a symlink to /run: then these are the same files, listed once.
-    [[ "$(readlink -f /var/run)" == /run ]] \
-        || socks+=(/var/run/dbus/system_bus_socket /var/run/avahi-daemon/socket)
+    if [[ "$(readlink -f /var/run)" != /run ]]; then
+        socks+=(/var/run/dbus/system_bus_socket)
+        [[ "${1:-}" == system-bus ]] || socks+=(/var/run/avahi-daemon/socket)
+    fi
     for sock in "${socks[@]}"; do
         [[ -S "${sock}" ]] || continue
         if timeout 5 s6-ipcclient "${sock}" true > /dev/null 2>&1; then

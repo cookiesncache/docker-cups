@@ -38,7 +38,7 @@ abandoned 2021 Unraid CUPS template (`josecoelho/unraid-templates` → `ydkn/cup
   operation policy plus `Encryption Required`), so CUPS never asks for a password over plain http.
   The Unraid template's WebUI opens https.
 - Printing and browsing are limited to `localhost` + `CUPS_ALLOWED_NETWORKS` (default: private
-  address ranges); `all`, `*`, `/0` and IPv6 ranges that would also match every IPv4 client are
+  address ranges); `all`, `*`, `/0` and IPv6 ranges that would also match IPv4 clients are
   refused. No `ServerAlias *`.
 - The container **refuses to start** if a host D-Bus (`/var/run/dbus` or `/run/dbus`) is mounted
   into it, as the old template did — or the host's `/run`, or anything already serving a system bus —

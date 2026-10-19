@@ -26,8 +26,9 @@ if [[ "${airprint}" != true ]]; then
 fi
 
 # Defence in depth: init-cups-config already refused to start on a host D-Bus mount. Check again
-# before touching /run/dbus, because what follows deletes files there.
-/usr/local/bin/cups-dbus-guard || exit 1
+# before touching /run/dbus, because what follows deletes files there. --system-bus-only: after a
+# bus crash our own avahi-daemon may still be exiting, and its live socket must not read as foreign.
+/usr/local/bin/cups-dbus-guard --system-bus-only || exit 1
 
 mkdir -p /run/dbus
 # Stale from the previous run (s6-overlay does not clear /run on `docker restart`). dbus-daemon
