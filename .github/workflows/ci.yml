@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  # Deliberately NOT filtered to `branches: [main]`. That filter keys on the PR's BASE, so a stacked
+  # PR - one opened against another PR's branch - would get no CI at all until its parent merged and
+  # GitHub retargeted it: precisely backwards, since the stacked PR is the one whose diff nobody has
+  # run yet (docker-openclaw #10 sat unverified exactly this way). One job per push to any PR is
+  # cheaper than merging a parent to find out whether the child was ever tested.
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  # Job name is the required-status-check context in main's branch protection.
+  # Deliberately NOT "build": build.yml already has a job by that name, and GitHub warns
+  # that duplicate job names across workflows make required-check results ambiguous.
+  pr-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Pinned and checksum-verified rather than the runner's preinstalled ShellCheck. That one moves
+      # whenever GitHub updates the runner image, and a new release brings new checks - which would
+      # turn an unrelated PR (a Dependabot base bump, say) red overnight. The lesson of
+      # docker-openclaw #29: a floating input must not fail a PR that did not touch it. Bump
+      # deliberately, together with fixes for whatever the new release flags.
+      - name: Install ShellCheck (pinned)
+        env:
+          SC_VERSION: v0.11.0
+          SC_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/shellcheck.tar.xz" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SC_VERSION}/shellcheck-${SC_VERSION}.linux.x86_64.tar.xz"
+          echo "${SC_SHA256}  ${RUNNER_TEMP}/shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf "${RUNNER_TEMP}/shellcheck.tar.xz" -C "${RUNNER_TEMP}"
+          echo "SHELLCHECK=${RUNNER_TEMP}/shellcheck-${SC_VERSION}/shellcheck" >> "$GITHUB_ENV"
+
+      # ShellCheck over root/, .github/scripts/ and the Dockerfile's heredoc RUN; templates/cups.xml
+      # (and ca_profile.xml) must be well-formed, or Community Applications silently drops the tile.
+      - name: Lint
+        run: bash .github/scripts/lint.sh
+
+      # The gate's pure helpers: packages.txt parsing (identical to the Dockerfile's), the apt
+      # simulation parser that the package fingerprint hangs on, the FROM-line digest check, the
+      # version/tag derivation, both directions of --check-image, and which registry errors may read
+      # as "nothing published". No registry, no Docker, no network.
+      - name: Gate self-test
+        run: bash .github/scripts/gate.sh --self-test
+
+      # Same pinned BuildKit as build.yml, so a PR is built the way the published image will be.
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
+
+      # No registry login: the LSIO base is public, so anonymous pulls suffice. Dependabot-triggered
+      # runs get a read-only token and no secrets, and this job needs neither. The build's only
+      # moving input is the Ubuntu archive, which is the product itself, not test scaffolding.
+      - name: Build (never pushed)
+        run: |
+          set -euo pipefail
+          docker buildx build --load -t cups:pr .
+
+      # Every container smoke.sh boots - peer client included - is made from cups:pr, so no other
+      # image is pulled and nothing floating can fail this step.
+      - name: Smoke test
+        run: bash .github/scripts/smoke.sh cups:pr

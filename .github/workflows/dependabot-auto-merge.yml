@@ -1,0 +1,73 @@
+name: dependabot-auto-merge
+
+# pull_request_target runs in the BASE repository context with write permissions.
+#
+# There is deliberately no actions/checkout here, and no build step. Checking out and
+# executing pull-request code in this context is a known privilege-escalation pattern,
+# and this repository publishes container images that other people install. API calls
+# only. The PR's code is validated by ci.yml, which runs in the untrusted PR context
+# with a read-only token, and is a required status check on main.
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          alert-lookup: true
+          # NOT secrets.GITHUB_TOKEN. fetch-metadata's README: "this must be set to a
+          # personal access token (PAT) or an installation access token (App Token) if
+          # you enable alert-lookup" - the alert lookup is a GraphQL vulnerabilityAlerts
+          # query the default token cannot make. With the wrong token this step FAILS
+          # (main.ts routes the API error to core.setFailed), which is the desired loud
+          # failure; it does not silently return empty.
+          #
+          # Store this as an *Actions* secret (Settings -> Secrets and variables ->
+          # Actions). Dependabot-triggered runs on pull_request/push read the Dependabot
+          # secret store, but pull_request_target is explicitly NOT one of those events -
+          # it runs in the trusted base context and reads Actions secrets. Verified the
+          # hard way: a Dependabot-store secret created six minutes before these runs was
+          # invisible to them ("github-token is not set!").
+          # Fine-grained, this repository only, read-only Dependabot alerts + Metadata.
+          github-token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN }}
+
+      # Two things auto-merge, both gated by the required pr-smoke check:
+      #
+      #   1. Security updates (non-empty ghsa-id). Cooldown does not apply to these, so
+      #      they arrive as soon as the advisory does. In practice this only ever fires
+      #      for github-actions: Docker is not a GitHub Advisory Database ecosystem, so a
+      #      base-image bump never carries a GHSA.
+      #   2. Docker ecosystem updates - the base image digest pin. The diff is exactly one
+      #      pinned line and pr-smoke boots the resulting image, so holding these for
+      #      manual review only delays base security patches without adding real scrutiny.
+      #
+      # The docker condition is deliberate, and its limits are worth stating rather than
+      # rediscovering:
+      #   - The evidence base for cooldown as a control is npm-derived. Docker is not a GitHub
+      #     Advisory Database ecosystem, so none of it transfers cleanly.
+      #   - "Caught during the cooldown" has to mean REMOVED AT THE REGISTRY, not merely
+      #     detected or reported. A malicious digest that is still pullable when the window
+      #     expires is auto-merged exactly as if nothing had happened.
+      #   - Cooldown does nothing at all against a dormant backdoor, maintainer sabotage, or a
+      #     compromised build system: each of those ships a payload that is not yet, or never,
+      #     publicly known to be bad.
+      # What actually carries the weight here is the digest pin plus pr-smoke booting the image.
+      - name: Enable auto-merge
+        if: steps.meta.outputs.ghsa-id != '' || steps.meta.outputs.package-ecosystem == 'docker'
+        run: |
+          echo "::notice::auto-merging ${{ steps.meta.outputs.dependency-names }} (ecosystem=${{ steps.meta.outputs.package-ecosystem }}, ghsa=${{ steps.meta.outputs.ghsa-id || 'none' }})"
+          gh pr merge --auto --squash "${{ github.event.pull_request.html_url }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Leave routine updates for review
+        if: steps.meta.outputs.ghsa-id == '' && steps.meta.outputs.package-ecosystem != 'docker'
+        run: echo "::notice::${{ steps.meta.outputs.dependency-names }} is a routine ${{ steps.meta.outputs.package-ecosystem }} update - not auto-merging."

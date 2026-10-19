@@ -1,0 +1,188 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# init-cups-queue (oneshot, after svc-cups) - optional queue auto-create from PRINTER_*.
+#
+# Does nothing unless both PRINTER_NAME and PRINTER_MODEL are set (init-cups-config has already
+# validated every PRINTER_* value and refused to start on bad ones). Then:
+#
+#   queue absent  -> lpadmin -p NAME -E -v URI -m MODEL [-D ...] [-L ...]
+#                            -o printer-is-shared=true -o printer-error-policy=retry-job
+#                            -o PageSize=$CUPS_PAPER_SIZE [-o PRINTER_OPTIONS ...]
+#                    then cupsenable + cupsaccept, and make it the default destination if there
+#                    is none yet.
+#   queue present -> only refresh its device URI, and only if PRINTER_URI is set (or a USB printer
+#                    was autodetected) and differs. Everything else - defaults, options, sharing,
+#                    enabled state - belongs to the user from then on and is never touched again,
+#                    with one exception: a queue CUPS itself stopped because its device URI named a
+#                    backend this image does not ship (an hp:/ or dnssd:// queue imported from the
+#                    old template) is re-enabled once its URI is usable.
+#
+# URI: PRINTER_URI, else autodetect - run the usb backend in discovery mode and use the result only
+# if it found EXACTLY one usb:// printer; otherwise log what was found and skip.
+#
+# It ALWAYS exits 0. An unplugged printer, a slow driver or an lpadmin error is logged as a warning
+# and must never stop the print server itself from starting. So: no `set -e`, and the work runs in
+# a subshell so that even an unexpected abort (set -u) cannot change this script's exit status.
+
+set -uo pipefail
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../../../../usr/local/lib/docker-cups/common.sh
+source /usr/local/lib/docker-cups/common.sh
+
+unset CUPS_ADMIN_PASSWORD FILE__CUPS_ADMIN_PASSWORD
+export LC_ALL=C   # stable lpstat/lpadmin wording for the matches below
+
+PRINTERS_CONF=/config/cups/printers.conf
+
+# The queue's device URI exactly as cupsd stored it. `lpstat -v` reports a sanitised copy with any
+# user:password@ removed, which would never compare equal to a PRINTER_URI that carries
+# credentials - the URI would be re-applied (and logged) on every boot. printers.conf (root-only,
+# written at once: DirtyCleanInterval 0) has the real one. Falls back to lpstat when absent.
+current_device_uri() {   # current_device_uri NAME
+    local q="$1" key value inq=0 out
+    if [[ -r "${PRINTERS_CONF}" ]]; then
+        while read -r key value; do
+            case "${key}" in
+                "<Printer"|"<DefaultPrinter")
+                    inq=0; [[ "${value,,}" == "${q,,}>" ]] && inq=1 ;;
+                "</Printer>"|"</DefaultPrinter>") inq=0 ;;
+                DeviceURI)
+                    if (( inq )); then printf '%s' "${value}"; return 0; fi ;;
+            esac
+        done < "${PRINTERS_CONF}"
+    fi
+    out="$(lpstat -v "${q}" 2>/dev/null)" || return 0
+    printf '%s' "${out#*: }"
+}
+
+# cupsd STOPS a queue whose device URI names a backend that does not exist ("Backend ... does not
+# exist!") and that stop outlives fixing the URI. Re-enable such a queue once the backend for its
+# current URI exists - and only then: a queue the user paused for any other reason stays paused.
+reenable_if_backend_fixed() {   # reenable_if_backend_fixed NAME
+    local q="$1" st scheme
+    st="$(lpstat -p "${q}" 2>/dev/null)" || return 0
+    [[ "${st}" == *" disabled since "* && "${st}" == *"Backend "*" does not exist"* ]] || return 0
+    scheme="$(current_device_uri "${q}")"
+    scheme="${scheme%%:*}"
+    [[ "${scheme}" =~ ^[a-z][a-z0-9+.-]*$ && -f "/usr/lib/cups/backend/${scheme}" ]] || return 0
+    if cupsenable "${q}"; then
+        cups_log "queue: '${q}' re-enabled (CUPS had stopped it because its earlier device URI needed a backend this image does not ship)"
+    else
+        cups_warn "queue: could not re-enable '${q}' - run: docker exec <container> cupsenable ${q}"
+    fi
+}
+
+queue_main() {
+    local name="${PRINTER_NAME:-}" model="${PRINTER_MODEL:-}" uri="${PRINTER_URI:-}"
+    local paper out current i
+    local -a found args opts
+
+    [[ -n "${name}" && -n "${model}" ]] || return 0
+
+    # Re-check what init-cups-config validated; this script must stay safe even when run by hand.
+    if ! cups_valid_queue_name "${name}" || ! cups_valid_model "${model}" \
+       || { [[ -n "${uri}" ]] && ! cups_valid_device_uri "${uri}"; }; then
+        cups_warn "queue: invalid PRINTER_NAME/PRINTER_MODEL/PRINTER_URI - skipping auto-create"
+        return 0
+    fi
+    paper=Letter
+    cups_check_paper_size "${CUPS_PAPER_SIZE:-Letter}" && paper="${CUPS_OUT}"
+
+    # cupsd was just started by s6 and has no readiness signal of its own: poll for it (~30 s).
+    for (( i = 0; i < 30; i++ )); do
+        out="$(lpstat -r 2>/dev/null)"
+        [[ "${out}" == "scheduler is running" ]] && break
+        sleep 1
+    done
+    if [[ "${out}" != "scheduler is running" ]]; then
+        cups_warn "queue: cupsd is not answering after 30s - skipping auto-create of '${name}'"
+        return 0
+    fi
+
+    if [[ -z "${uri}" ]]; then
+        # Discovery mode: the backend with no arguments lists devices, one per line:
+        #   direct usb://HP/LaserJet%20Pro%20M203-M206?serial=... "HP LaserJet ..." ...
+        out="$(timeout 30 /usr/lib/cups/backend/usb 2>/dev/null)"
+        found=()
+        while read -r cls dev _; do
+            [[ "${cls}" == direct && "${dev}" == usb://* ]] && found+=("${dev}")
+        done <<< "${out}"
+        case "${#found[@]}" in
+            1)
+                uri="${found[0]}"
+                cups_log "queue: autodetected USB printer ${uri}" ;;
+            0)
+                cups_log "queue: PRINTER_URI is empty and no USB printer was found (is /dev/bus/usb mapped and the printer on?)" ;;
+            *)
+                cups_warn "queue: PRINTER_URI is empty and ${#found[@]} USB printers were found - set PRINTER_URI to one of:"
+                for i in "${found[@]}"; do printf '**** WARN:     %s ****\n' "${i}" >&2; done ;;
+        esac
+        if [[ -n "${uri}" ]] && ! cups_valid_device_uri "${uri}"; then
+            cups_warn "queue: autodetected URI $(cups_show "${uri}") has unexpected characters - ignoring it"
+            uri=""
+        fi
+    fi
+
+    if lpstat -p "${name}" > /dev/null 2>&1; then
+        # Existing queue: the user's settings win. Only the device URI follows the environment.
+        if [[ -n "${uri}" ]]; then
+            current="$(current_device_uri "${name}")"
+            if [[ "${current}" != "${uri}" ]]; then
+                if out="$(timeout 60 lpadmin -p "${name}" -v "${uri}" 2>&1)"; then
+                    cups_log "queue: '${name}' device URI updated to $(cups_redact_uri "${uri}")"
+                else
+                    cups_warn "queue: could not update the device URI of '${name}': ${out}"
+                fi
+            fi
+        fi
+        reenable_if_backend_fixed "${name}"
+        cups_log "queue: '${name}' already exists - leaving its settings alone"
+        return 0
+    fi
+
+    if [[ -z "${uri}" ]]; then
+        cups_warn "queue: cannot create '${name}' without a device URI - set PRINTER_URI (see 'docker exec <container> lpinfo -v')"
+        return 0
+    fi
+
+    # -E must come AFTER -p: before it, lpadmin reads it as "force encryption" instead of "enable".
+    args=(-p "${name}" -E -v "${uri}" -m "${model}")
+    [[ -n "${PRINTER_DESCRIPTION:-}" ]] && args+=(-D "${PRINTER_DESCRIPTION}")
+    [[ -n "${PRINTER_LOCATION:-}" ]] && args+=(-L "${PRINTER_LOCATION}")
+    args+=(-o printer-is-shared=true -o printer-error-policy=retry-job -o "PageSize=${paper}")
+    if [[ -n "${PRINTER_OPTIONS:-}" ]]; then
+        read -r -a opts <<< "${PRINTER_OPTIONS}"
+        for i in "${opts[@]}"; do
+            if cups_valid_option "${i}"; then
+                args+=(-o "${i}")
+            else
+                cups_warn "queue: ignoring invalid PRINTER_OPTIONS token $(cups_show "${i}")"
+            fi
+        done
+    fi
+
+    cups_log "queue: creating '${name}' (${model}) on $(cups_redact_uri "${uri}")"
+    # -m everywhere queries the printer over IPP, so give lpadmin time, but not forever.
+    if ! out="$(timeout 180 lpadmin "${args[@]}" 2>&1)"; then
+        cups_warn "queue: lpadmin could not create '${name}': ${out:-timed out or failed}"
+        return 0
+    fi
+    # CUPS 2.4 lpadmin warns on every PPD-based queue that "Printer drivers are deprecated"
+    # (a CUPS 3.x roadmap note, not an error); keep anything else it says.
+    out="$(grep -v 'Printer drivers are deprecated' <<< "${out}")"
+    [[ -n "${out}" ]] && cups_log "queue: lpadmin: ${out}"
+    cupsenable "${name}" || cups_warn "queue: cupsenable '${name}' failed"
+    cupsaccept "${name}" || cups_warn "queue: cupsaccept '${name}' failed"
+
+    out="$(lpstat -d 2>/dev/null)"
+    if [[ "${out}" != "system default destination: "* ]]; then
+        if lpadmin -d "${name}"; then
+            cups_log "queue: '${name}' is now the default destination"
+        fi
+    fi
+    cups_log "queue: '${name}' created (shared, error policy retry-job, default PageSize ${paper})"
+}
+
+( queue_main ) || cups_warn "queue: auto-create aborted unexpectedly - the print server keeps running"
+exit 0

@@ -1,0 +1,75 @@
+<?xml version="1.0"?>
+<!--
+  Unraid Community Applications template for the unofficial LinuxServer-style CUPS image.
+  Deploy: see the "Install" section of ../README.md.
+
+  Notes for editors:
+  - Variable names and defaults must match root/usr/local/lib/docker-cups/common.sh and
+    root/etc/s6-overlay/s6-rc.d/init-cups-config/run exactly. Unraid passes blank fields through
+    as empty strings, which the image treats as "unset" (= the built-in default).
+  - ExtraParams is run through a shell by Unraid, so the single quotes around the cgroup rule are
+    needed. Both parameters are load-bearing: the cgroup rule lets CUPS open the printer's USB
+    device node, and the fixed hostname keeps the TLS certificate (and the AirPrint name) stable
+    across container recreates.
+  - WebUI is https on purpose. The admin pages refuse plain http with a "426 Upgrade Required"
+    redirect, and cupsd builds that redirect from the container's own address: in bridge mode that
+    is the internal Docker IP and port (https://172.17.x.y:631/...), which the LAN cannot reach.
+    Starting the web session on https keeps every link on it working.
+  - The icon is an original drawing in this repository (templates/img/cups.png, GPL-3.0 like the
+    rest of the packaging), not the CUPS logo: this image is not affiliated with OpenPrinting.
+-->
+<Container version="2">
+  <Name>cups</Name>
+  <Repository>ghcr.io/cookiesncache/cups:latest</Repository>
+  <Registry>https://github.com/cookiesncache/docker-cups/pkgs/container/cups</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/cookiesncache/docker-cups/issues</Support>
+  <Project>https://github.com/cookiesncache/docker-cups</Project>
+  <Overview>Unofficial, LinuxServer.io-style CUPS print server (CUPS 2.4 from Ubuntu 26.04 packages) for sharing a USB printer from Unraid with the computers and phones on your LAN - not affiliated with LinuxServer.io or OpenPrinting (the CUPS project). LAN only: never forward port 631 from your router. There is no default password: remote administration stays off until you set CUPS_ADMIN_USER and CUPS_ADMIN_PASSWORD, and the admin pages then work over https only. The WebUI button opens https: your browser warns once about the self-signed certificate - accept it. Add your printer in the web UI (Administration, Add Printer) or with the PRINTER_* variables. AirPrint (automatic discovery on iPhone, iPad and Mac) needs CUPS_AIRPRINT=true plus Network Type br0 (or eth0/bond0) with a fixed IP address - mDNS cannot work in bridge mode. Coming from the old CUPS template (ydkn/cups, admin/admin)? Remove the old container, point /config at its appdata folder once to import your printers and PPDs, and do not carry over its /var/run/dbus mapping (this container refuses to start with it) or its single /dev/bus/usb/BUS/DEVICE mapping (this template maps the whole /dev/bus/usb read-only instead, which survives printer power cycles).</Overview>
+  <Category>Tools: Network:Other</Category>
+  <WebUI>https://[IP]:[PORT:631]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/cookiesncache/docker-cups/main/templates/cups.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/cookiesncache/docker-cups/main/templates/img/cups.png</Icon>
+  <ExtraParams>--device-cgroup-rule='c 189:* rmw' --hostname=unraid-cups</ExtraParams>
+  <PostArgs/>
+  <DonateText/>
+  <DonateLink/>
+  <Description>Unofficial LinuxServer.io-style CUPS print server for a USB printer, with optional AirPrint. Queues, PPDs and the TLS certificate persist under /config.</Description>
+  <Changes>
+### Initial release
+
+Unofficial replacement for the abandoned 2021 CUPS template (ydkn/cups). No default password,
+LAN-only access rules, admin pages behind https, optional AirPrint on br0, and USB printers keep
+working after a power cycle.
+
+Coming from the old template: point /config at its appdata folder once to import your printers,
+and remove its /var/run/dbus mapping and its single /dev/bus/usb/BUS/DEVICE mapping.
+  </Changes>
+  <Config Name="WebUI / IPP" Target="631" Default="631" Mode="tcp" Description="IPP printing, the web interface and https all share this one port. LAN only: never forward it from your router. Ignored on br0/eth0 custom networks, where the container has its own IP address." Type="Port" Display="always" Required="true" Mask="false">631</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/docker-cups" Mode="rw" Description="Persistent data: queues, PPDs and the TLS certificate, in a cups/ subfolder that stays owned by root:lp on purpose (cupsd requires it). Coming from the old CUPS template? Point this at its appdata folder (usually /mnt/user/appdata/cups) once: printers.conf and ppd/ are imported and the originals are left untouched." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/docker-cups</Config>
+  <Config Name="USB devices" Target="/dev/bus/usb" Default="/dev/bus/usb" Mode="ro" Description="USB printers. Mapped read-only; together with --device-cgroup-rule='c 189:* rmw' in Extra Parameters this lets CUPS open the printer, including after it is power-cycled and gets a new device number. Do not add a single /dev/bus/usb/BUS/DEVICE device mapping instead. Remove this only if you print to network printers exclusively." Type="Path" Display="always" Required="false" Mask="false">/dev/bus/usb</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID that owns the /config folder itself. Unraid default: 99 (nobody). The cups/ subfolder inside it stays root:lp regardless." Type="Variable" Display="always" Required="true" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID that owns the /config folder itself. Unraid default: 100 (users)." Type="Variable" Display="always" Required="true" Mask="false">100</Config>
+  <Config Name="UMASK" Target="UMASK" Default="022" Mode="" Description="Umask for files the container creates." Type="Variable" Display="advanced" Required="false" Mask="false">022</Config>
+  <Config Name="TZ" Target="TZ" Default="America/New_York" Mode="" Description="Container timezone (e.g. America/New_York), used for job and log times." Type="Variable" Display="advanced" Required="false" Mask="false">America/New_York</Config>
+  <Config Name="CUPS_ADMIN_USER" Target="CUPS_ADMIN_USER" Default="printadmin" Mode="" Description="Login for the CUPS admin pages (add and change printers from your browser). Created inside the container on every start. Must not be an existing system account (root, lp, nobody, ...). Remote administration stays off unless CUPS_ADMIN_PASSWORD is set too." Type="Variable" Display="always" Required="false" Mask="false">printadmin</Config>
+  <Config Name="CUPS_ADMIN_PASSWORD" Target="CUPS_ADMIN_PASSWORD" Default="" Mode="" Description="Password for CUPS_ADMIN_USER - use a long random one (12+ characters). CUPS only asks for it over https (self-signed certificate; your browser warns once), so always log in through https://. Changing it takes effect on the next container start. Leave empty to keep remote administration off; docker exec cups lpadmin ... still works." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="CUPS_SERVER_ALIASES" Target="CUPS_SERVER_ALIASES" Default="tower" Mode="" Description="Extra host names you type in the browser address bar, e.g. your Unraid server's name (tower). Space- or comma-separated. IP addresses, localhost and NAME.local always work; a * wildcard is refused. This is the fix for '400 Bad Request'." Type="Variable" Display="always" Required="false" Mask="false">tower</Config>
+  <Config Name="CUPS_PAPER_SIZE" Target="CUPS_PAPER_SIZE" Default="Letter" Mode="" Description="Default paper size of the server and of queues created by PRINTER_*: Letter, Legal, Executive, Tabloid, Statement, A3, A4, A5 or A6." Type="Variable" Display="always" Required="false" Mask="false">Letter</Config>
+  <Config Name="CUPS_AIRPRINT" Target="CUPS_AIRPRINT" Default="false" Mode="" Description="true: advertise shared printers to iPhones, iPads and Macs (AirPrint/Bonjour). Requires Network Type br0 (or eth0/bond0) with a Fixed IP address - mDNS does not work in bridge mode - and a stable hostname (--hostname=unraid-cups in Extra Parameters). Clients must be on the same LAN/VLAN, without Wi-Fi client isolation. false: no discovery; add the printer on clients by address instead." Type="Variable" Display="always" Required="false" Mask="false">false</Config>
+  <Config Name="CUPS_ALLOWED_NETWORKS" Target="CUPS_ALLOWED_NETWORKS" Default="@LOCAL 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 [fc00::]/7" Mode="" Description="Who may print and browse: space- or comma-separated CIDRs (192.168.1.0/24), addresses, host names, @LOCAL, @IF(eth0) or [IPv6]/length. localhost is always allowed. all, * and /0 are refused, and an invalid value stops the container with an error. In bridge mode LAN clients keep their real address, so your LAN must be listed (the default covers all private ranges). Fix for '403 Forbidden'." Type="Variable" Display="advanced" Required="false" Mask="false">@LOCAL 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 [fc00::]/7</Config>
+  <Config Name="CUPS_ADMIN_NETWORKS" Target="CUPS_ADMIN_NETWORKS" Default="" Mode="" Description="Who may open the admin pages (login and https still required). Same format as CUPS_ALLOWED_NETWORKS; empty = the same networks. Ignored - admin is localhost only - unless CUPS_ADMIN_USER and CUPS_ADMIN_PASSWORD are both set." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="CUPS_AIRPRINT_HOSTNAME" Target="CUPS_AIRPRINT_HOSTNAME" Default="" Mode="" Description="Name of the server: the TLS certificate name and, with AirPrint, the mDNS name (NAME.local). Empty = the container hostname (--hostname=unraid-cups in Extra Parameters); a random container ID is replaced by unraid-cups. One DNS label: letters, digits and inner hyphens." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="CUPS_LOG_LEVEL" Target="CUPS_LOG_LEVEL" Default="warn" Mode="" Description="cupsd log level: none, emerg, alert, crit, error, warn, notice, info, debug or debug2. Everything goes to the container log." Type="Variable" Display="advanced" Required="false" Mask="false">warn</Config>
+  <Config Name="CUPS_WEB_INTERFACE" Target="CUPS_WEB_INTERFACE" Default="true" Mode="" Description="true/false: the CUPS web interface on port 631. Printing is not affected." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="CUPS_MANAGED_CONFIG" Target="CUPS_MANAGED_CONFIG" Default="true" Mode="" Description="true: cupsd.conf and cups-files.conf are regenerated from these variables on every start. false (experts only): they are written once and then left for you to edit, and the access, admin and TLS settings are no longer enforced by the image." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="PRINTER_NAME" Target="PRINTER_NAME" Default="" Mode="" Description="Optional: create this print queue on startup, e.g. M203 (letters, digits, _ . -). Needs PRINTER_MODEL too; all PRINTER_* are ignored otherwise. An existing queue is never changed, except that its device address follows PRINTER_URI." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="PRINTER_MODEL" Target="PRINTER_MODEL" Default="" Mode="" Description="Driver for that queue, as listed by: docker exec cups lpinfo -m. HP LaserJet Pro M203-M206: postscript-hp:0/ppd/hplip/HP/hp-laserjet_pro_m203_m206-ps.ppd. Network printers with IPP Everywhere: everywhere." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="PRINTER_URI" Target="PRINTER_URI" Default="" Mode="" Description="Where the printer is. Empty: autodetect a USB printer (used only if exactly one is found). Otherwise e.g. usb://HP/LaserJet%20Pro%20M203-M206?serial=... (see: docker exec cups lpinfo -v), socket://192.168.1.50:9100 or ipp://printer.lan/ipp/print." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="PRINTER_DESCRIPTION" Target="PRINTER_DESCRIPTION" Default="" Mode="" Description="Optional description of the queue (shown to clients, e.g. HP LaserJet Pro M203). Applied when the queue is created. Max 127 characters." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="PRINTER_LOCATION" Target="PRINTER_LOCATION" Default="" Mode="" Description="Optional location of the queue (e.g. Office). Applied when the queue is created. Max 127 characters." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="PRINTER_OPTIONS" Target="PRINTER_OPTIONS" Default="" Mode="" Description="Optional queue defaults, applied when the queue is created: space-separated key=value pairs, e.g. Duplex=DuplexNoTumble. List what a driver offers with: docker exec cups lpoptions -p NAME -l" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>

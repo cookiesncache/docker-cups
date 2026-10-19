@@ -1,0 +1,16 @@
+
+───────────────────────────────────────────────────
+
+      docker-cups   ·   UNOFFICIAL
+
+  CUPS print server, LinuxServer.io-style.
+  Maintained by cookiesncache.
+
+  Built on a linuxserver.io base image, but this is
+  NOT an official LinuxServer.io image and is not
+  affiliated with, endorsed by, or supported by
+  LinuxServer.io or OpenPrinting (the CUPS project).
+
+  https://github.com/cookiesncache/docker-cups
+
+───────────────────────────────────────────────────

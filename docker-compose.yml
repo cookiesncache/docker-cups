@@ -1,0 +1,56 @@
+---
+services:
+  cups:
+    build: .
+    image: cups:lsio
+    container_name: cups
+    # A stable name: it becomes the CN of the self-signed TLS certificate kept under
+    # ./config/cups/ssl (and the AirPrint name). Without it Docker uses the container ID, which
+    # changes on every recreate; the image then falls back to "unraid-cups" and says so in the log.
+    hostname: unraid-cups
+    environment:
+      # Unraid: PUID=99 / PGID=100 (nobody:users) so it matches appdata ownership.
+      # Standard Linux host: PUID=1000 / PGID=1000. Only ./config itself follows these;
+      # ./config/cups stays root:lp because cupsd requires it.
+      - PUID=99
+      - PGID=100
+      - UMASK=022
+      - TZ=America/New_York
+      # Remote administration (web UI /admin, https only) stays OFF unless both are set.
+      # Put the password in a .env file next to this one (git-ignored), or use a Docker secret
+      # with FILE__CUPS_ADMIN_PASSWORD=/run/secrets/<name> instead - its source file root-owned
+      # and 0600, or the print filters (user lp) can read it (the log warns).
+      # The web interface: https://<host>:631/ (self-signed certificate - accept it once).
+      - CUPS_ADMIN_USER=${CUPS_ADMIN_USER:-}
+      - CUPS_ADMIN_PASSWORD=${CUPS_ADMIN_PASSWORD:-}
+      # Host names you type in the browser besides IP addresses / localhost / *.local
+      # (fixes "400 Bad Request"), e.g. your server's name.
+      - CUPS_SERVER_ALIASES=${CUPS_SERVER_ALIASES:-}
+      - CUPS_PAPER_SIZE=Letter
+      # Advanced. Who may print (default: @LOCAL + all private IPv4 ranges + IPv6 ULA) and who
+      # may reach /admin (default: the same). Invalid values stop the container with an error.
+      #- CUPS_ALLOWED_NETWORKS=192.168.1.0/24
+      #- CUPS_ADMIN_NETWORKS=192.168.1.10
+      # AirPrint needs the container on the LAN itself (macvlan/ipvlan with a fixed IP), not on a
+      # bridge network with published ports - mDNS does not cross Docker's NAT. See README.
+      - CUPS_AIRPRINT=false
+      # Optional queue auto-create (all PRINTER_* are ignored unless NAME and MODEL are set).
+      # Example for an HP LaserJet Pro M203-M206 on USB (empty URI = autodetect one USB printer):
+      #- PRINTER_NAME=M203
+      #- PRINTER_MODEL=postscript-hp:0/ppd/hplip/HP/hp-laserjet_pro_m203_m206-ps.ppd
+      #- PRINTER_URI=
+      #- PRINTER_DESCRIPTION=HP LaserJet Pro M203
+      #- PRINTER_LOCATION=Office
+    volumes:
+      - ./config:/config
+      # USB printers: the whole bus tree, read-only, plus the cgroup rule below. Survives the
+      # printer being power-cycled and renumbered. See README for a tighter variant.
+      - /dev/bus/usb:/dev/bus/usb:ro
+    device_cgroup_rules:
+      - 'c 189:* rmw'
+    ports:
+      # LAN only - never forward 631 from the internet. On a dual-stack host whose IPv6 address is
+      # reachable from outside, publish on IPv4 only (0.0.0.0:631:631): Docker relays IPv6
+      # connections from its bridge gateway, which the default allow list admits (README, Security).
+      - 631:631
+    restart: unless-stopped

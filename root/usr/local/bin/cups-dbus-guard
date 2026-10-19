@@ -1,0 +1,79 @@
+#!/bin/bash
+#
+# cups-dbus-guard - refuse to run on top of a host D-Bus (or a host /run).
+#
+# The abandoned 2021 Unraid CUPS template mapped the HOST's /var/run/dbus into the container
+# read-write, and people migrating from it will carry that mapping over. That would hand every
+# process in this container (including print filters running untrusted documents) the host's system
+# bus, and our own dbus-daemon would unlink the host's socket from under it on start - after which
+# host processes connecting to the system bus would be talking to the container's bus instead.
+#
+# Three checks, all read-only:
+#   1. anything mounted at or below /run/dbus or /var/run/dbus          (the old template's mapping)
+#   2. a non-tmpfs mount at /run or /var/run itself                       (a host directory there)
+#   3. a system-bus or Avahi socket that already ACCEPTS connections      (the host's own /run,
+#      which is a tmpfs and so passes check 2, mounted over ours: our daemons are not running
+#      whenever this is called, so a live bus can only be someone else's)
+#
+# Exits 0 when all pass. Otherwise prints why to stderr and exits 1. It never deletes or changes
+# anything, so it must run before anything else touches /run/dbus or /run/avahi-daemon (stale
+# pid/socket cleanup included).
+#
+# Called by init-cups-config (which then fails the container start) and again by svc-dbus, with
+# --system-bus-only: when svc-dbus (re)starts, our own avahi-daemon may still be on its way out
+# (it exits when the bus goes away), so its socket is not evidence of anything there.
+
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=../lib/docker-cups/common.sh
+source /usr/local/lib/docker-cups/common.sh
+
+live_scope=all
+case "${1:-}" in
+    "") ;;
+    --system-bus-only) live_scope=system-bus ;;
+    *) printf 'usage: cups-dbus-guard [--system-bus-only]\n' >&2; exit 2 ;;
+esac
+
+list() {   # list <lines> -> one indented ERROR line each
+    local m
+    while IFS= read -r m; do
+        printf '**** ERROR:     %s ****\n' "${m}" >&2
+    done <<< "$1"
+}
+
+refuse() {
+    cups_err "this image runs its own private D-Bus for AirPrint (CUPS_AIRPRINT=true) and must not touch the host's."
+    cups_err "nothing under /run/dbus or /run/avahi-daemon was changed. Refusing to start."
+    exit 1
+}
+
+# With a directory mounted over /run itself, s6-overlay (the base image's init, which runs before
+# anything of ours) has already created its own runtime entries in it.
+s6_note() {
+    cups_err "note: s6-overlay has already created its runtime entries (s6*, service) in that directory; remove them once the mapping is gone."
+}
+
+if found="$(cups_host_dbus_mounts)"; then
+    cups_err "a host D-Bus directory/socket is mounted into this container:"
+    list "${found}"
+    cups_err "remove the /var/run/dbus (or /run/dbus) path mapping from the container template."
+    refuse
+fi
+
+if found="$(cups_foreign_run_mounts)"; then
+    cups_err "a host directory is mounted over the container's /run (or /var/run):"
+    list "${found}"
+    cups_err "remove that path mapping from the container template - /run belongs to the container (use --tmpfs /run if you need one)."
+    s6_note
+    refuse
+fi
+
+if found="$(cups_live_foreign_sockets "${live_scope}")"; then
+    cups_err "a host D-Bus directory/socket is mounted into this container - something outside it is already serving:"
+    list "${found}"
+    cups_err "most likely the host's /run or /var/run is mapped into the container; remove that path mapping from the container template."
+    s6_note
+    refuse
+fi
+exit 0

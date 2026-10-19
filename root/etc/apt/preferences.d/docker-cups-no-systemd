@@ -1,0 +1,15 @@
+# Never install systemd (or the packages that exist only to plug into it) in this image.
+#
+# On Ubuntu 26.04 with apt 3.2, `apt-get install --no-install-recommends cups ...` already resolves
+# without systemd (it picks dbus-x11 as the D-Bus session provider). This pin turns that from a
+# solver accident into a guarantee: if a future package update tips the resolution toward
+# dbus-user-session -> libpam-systemd -> systemd, the image build fails loudly instead of shipping
+# an init system that cannot run under s6-overlay.
+#
+# It stays in the final image on purpose. LinuxServer's universal-package-install mod
+# (INSTALL_PACKAGES=...) runs apt at container start; without the pin, a package such as colord
+# would pull systemd and REMOVE the base's systemd-standalone-sysusers. With it, apt refuses with
+# "Depends: systemd but it is not going to be installed" and the container log says why.
+Package: systemd systemd-sysv dbus-user-session libpam-systemd
+Pin: version *
+Pin-Priority: -1

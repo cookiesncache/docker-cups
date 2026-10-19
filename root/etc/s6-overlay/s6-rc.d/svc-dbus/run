@@ -1,0 +1,41 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# svc-dbus (longrun) - a PRIVATE D-Bus system bus, needed only for AirPrint.
+#
+# cupsd publishes its DNS-SD records through avahi-client, which talks to avahi-daemon over the
+# D-Bus SYSTEM bus. So AirPrint needs, in this order: dbus-daemon -> avahi-daemon -> cupsd, which
+# is exactly the s6-rc dependency chain (svc-avahi and svc-cups both depend on this service).
+#
+# Readiness: notification-fd is 3, and dbus-daemon's --print-address=3 writes the bus address plus
+# a newline to fd 3 only once the bus socket is accepting connections. That newline is s6's
+# readiness signal, so svc-avahi/svc-cups start only against a working bus. timeout-up (30 s) turns
+# a bus that never comes up into a failed start - and a stopped container - instead of a hang.
+#
+# With CUPS_AIRPRINT=false (the default) this service idles: the dependency graph stays static and
+# the only cost is one sleeping process (the same idiom as the base image's own svc-cron).
+
+# The long-running daemons have no use for the admin password; do not let them inherit it.
+unset CUPS_ADMIN_PASSWORD FILE__CUPS_ADMIN_PASSWORD
+
+airprint="$(/usr/local/bin/cups-env-bool CUPS_AIRPRINT false 2>/dev/null)" || airprint=false
+if [[ "${airprint}" != true ]]; then
+    printf '\n' >&3   # "ready" - nothing to wait for
+    exec 3>&-
+    exec sleep infinity
+fi
+
+# Defence in depth: init-cups-config already refused to start on a host D-Bus mount. Check again
+# before touching /run/dbus, because what follows deletes files there. --system-bus-only: after a
+# bus crash our own avahi-daemon may still be exiting, and its live socket must not read as foreign.
+/usr/local/bin/cups-dbus-guard --system-bus-only || exit 1
+
+mkdir -p /run/dbus
+# Stale from the previous run (s6-overlay does not clear /run on `docker restart`). dbus-daemon
+# would also unlink a stale socket itself; the pid file is never written (--nopidfile).
+rm -f /run/dbus/pid /run/dbus/system_bus_socket
+
+# /etc/machine-id is absent in the image; D-Bus wants a stable-for-this-container ID.
+dbus-uuidgen --ensure
+
+exec dbus-daemon --system --nofork --nopidfile --nosyslog --print-address=3

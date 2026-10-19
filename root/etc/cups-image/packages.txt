@@ -1,0 +1,35 @@
+# Ubuntu packages installed into the image - the ONE list both the Dockerfile and CI read.
+#
+# Format: one package name per line; `#` starts a comment; blank lines are ignored. The Dockerfile
+# installs exactly these with `--no-install-recommends`, and CI's input fingerprint resolves the
+# same list (`apt-get -s install --no-install-recommends <these>` inside the pinned base) to decide
+# whether anything Ubuntu ships has changed. Edit it here and both follow; never duplicate it.
+#
+# Everything is from Ubuntu `main`. Recommends are deliberately NOT installed: the one that matters
+# is cups-browsed (cups-daemon Recommends it), the remote-printer auto-discovery daemon behind the
+# 2024 cups-browsed/libcupsfilters RCE chain. A USB print server has no use for it.
+
+# ---- core ----
+# `cups` is not a metapackage: it carries the usb backend, the web-interface CGIs, cups-driverd /
+# cups-deviced (lpinfo -m / -v) and cupsfilter. cups-daemon/cups-client are named explicitly so a
+# future reshuffle of the dependency tree cannot silently drop the scheduler or lpadmin.
+cups
+cups-client
+cups-daemon
+cups-filters
+ghostscript
+# Named so apt's choice of D-Bus session provider is deterministic (the alternative,
+# dbus-user-session, would drag in systemd; see etc/apt/preferences.d/docker-cups-no-systemd).
+dbus-x11
+
+# ---- AirPrint / DNS-SD (always installed - six packages, under 1 MiB - enabled at runtime) ----
+avahi-daemon
+dbus
+
+# ---- default drivers ----
+# printer-driver-postscript-hp carries the HP LaserJet Pro M203-M206 PPD
+# (postscript-hp:0/ppd/hplip/HP/hp-laserjet_pro_m203_m206-ps.ppd) and the hpps filter.
+printer-driver-postscript-hp
+printer-driver-gutenprint
+printer-driver-brlaser
+printer-driver-splix

@@ -1,0 +1,24 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# svc-cups (longrun) - the CUPS scheduler, in the foreground under s6.
+#
+# Runs as root on purpose: cupsd itself drops to lp for filters, but needs root for the backends that
+# require it (usb opens the printer's device node), for PAM authentication of the admin account,
+# and to read its root:lp 0600 printers.conf. PUID/PGID therefore do not apply to it.
+#
+# `-f` (foreground), never `-l` (on-demand/launchd mode, where the stock IdleExitTimeout would make
+# it exit when idle). Its error/access log goes to stderr (cups-files.conf), i.e. to `docker logs`.
+#
+# Dependencies (s6-rc): init-services (so init-cups-config has generated the config), svc-dbus and
+# svc-avahi (so that with AirPrint on, the bus is ready before cupsd creates its avahi client).
+
+unset CUPS_ADMIN_PASSWORD FILE__CUPS_ADMIN_PASSWORD
+
+# with-contenv applies the LSIO UMASK, which is meant for files written for PUID/PGID (Unraid users
+# often set 000). cupsd writes nothing of the kind - only root:lp files under /config/cups, the
+# spool and /run/cups - and creates its TLS private keys with whatever umask it inherits. The
+# conventional 022 for the daemon, whatever UMASK says.
+umask 022
+
+exec cupsd -f

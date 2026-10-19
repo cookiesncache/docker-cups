@@ -1,0 +1,35 @@
+#!/bin/bash
+#
+# svc-dbus finish - run by s6-supervise each time dbus-daemon exits.
+#
+# When the system bus goes away, cupsd's avahi client sees a disconnect and immediately tries to
+# reconnect - to a bus that is not there yet - fails, and gives up for good: DNS-SD/AirPrint stays
+# dead until cupsd is restarted or reloaded. A SIGHUP (reload) makes cupsd create a fresh avahi
+# client. (avahi-daemon restarting on its own is handled by cupsd without help.)
+#
+# The reload must happen AFTER the new dbus-daemon is ready, not now: sent from here directly,
+# cupsd would reconnect to the same dead socket and fail the same way. s6-supervise does not
+# restart the service until this script returns, so it cannot wait here either. Instead it starts a
+# fully detached waiter (double fork, so it is reparented to s6-svscan and reaped there): wait for
+# svc-dbus to be up AND ready again (-U), then HUP svc-cups.
+#
+# Nothing is done when the service was brought down on purpose (container shutdown: s6-rc stops
+# svc-cups first, then svc-dbus, so "wanted up" is false), or when cupsd is not running.
+
+svc_dbus=/run/service/svc-dbus
+svc_cups=/run/service/svc-cups
+
+[[ "$(s6-svstat -o wantedup "${svc_dbus}" 2>/dev/null)" == true ]] || exit 0
+[[ "$(s6-svstat -o up "${svc_cups}" 2>/dev/null)" == true ]] || exit 0
+
+echo "**** svc-dbus: dbus-daemon exited (status ${1:-?}${2:+, signal $2}); cupsd will be reloaded once the bus is back, to re-register DNS-SD ****"
+(
+    (
+        if s6-svwait -U -t 60000 "${svc_dbus}" && s6-svc -h "${svc_cups}"; then
+            echo "**** svc-dbus: D-Bus is back - sent SIGHUP to cupsd ****"
+        else
+            echo "**** WARN: svc-dbus: D-Bus did not come back within 60s - AirPrint/DNS-SD stays down until the container restarts ****" >&2
+        fi
+    ) < /dev/null &
+)
+exit 0

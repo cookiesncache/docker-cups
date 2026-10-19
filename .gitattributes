@@ -1,0 +1,10 @@
+# Force LF on all checkouts. Authoring on Windows must NOT introduce CRLF into the
+# s6 run scripts: a trailing \r turns "#!/usr/bin/with-contenv bash" into an invalid
+# interpreter path and the service silently fails to start. The same goes for the files
+# the Dockerfile reads at build time (packages.txt, debconf-selections, the apt pin): a CR
+# would end up inside a package name or a debconf answer.
+* text=auto eol=lf
+*.sh text eol=lf
+root/** text eol=lf
+# The template icon is binary; never let a text filter touch it.
+*.png binary

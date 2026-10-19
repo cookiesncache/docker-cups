@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Maintainer>
+  <Icon>https://github.com/cookiesncache.png</Icon>
+  <Profile>
+    Unofficial, LinuxServer.io-style Docker images for self-hosting on Unraid - PUID/PGID + s6-overlay with a /config volume, built and kept current via GitHub Actions. Not affiliated with LinuxServer.io. Currently: openclaw, cups.
+  </Profile>
+  <WebPage>https://github.com/cookiesncache</WebPage>
+  <Forum/>
+</Maintainer>
