@@ -48,7 +48,7 @@ for var in CUPS_ALLOWED_NETWORKS CUPS_ADMIN_NETWORKS CUPS_SERVER_ALIASES CUPS_PA
     if cups_has_ctrl "${!var:-}"; then
         if [[ "${var}" == PRINTER_URI ]]; then
             # A device URI may carry a network printer's password: never log it unredacted.
-            bad "${var}=$(cups_show "$(cups_redact_uri "${!var}")") contains a control character (newline, tab, ...)"
+            bad "${var}=$(cups_redact_uri "$(cups_show "${!var}")") contains a control character (newline, tab, ...)"
         else
             bad "${var}=$(cups_show "${!var}") contains a control character (newline, tab, ...)"
         fi
@@ -188,7 +188,7 @@ if [[ -n "${PRINTER_NAME:-}" && -n "${PRINTER_MODEL:-}" ]]; then
     cups_valid_model "${PRINTER_MODEL}" \
         || bad "PRINTER_MODEL=$(cups_show "${PRINTER_MODEL}") is not a driver name as listed by 'lpinfo -m' (or 'everywhere')"
     if [[ -n "${PRINTER_URI:-}" ]] && ! cups_valid_device_uri "${PRINTER_URI}"; then
-        bad "PRINTER_URI=$(cups_show "$(cups_redact_uri "${PRINTER_URI}")"): expected usb://, socket://, ipp://, ipps://, http:// or https:// with no spaces or quotes"
+        bad "PRINTER_URI=$(cups_redact_uri "$(cups_show "${PRINTER_URI}")"): expected usb://, socket://, ipp://, ipps://, http:// or https:// with no spaces or quotes"
     fi
     cups_valid_text127 "${PRINTER_DESCRIPTION:-}" || bad "PRINTER_DESCRIPTION is longer than 127 characters"
     cups_valid_text127 "${PRINTER_LOCATION:-}" || bad "PRINTER_LOCATION is longer than 127 characters"
@@ -540,9 +540,10 @@ PageLog stderr
 # Never let a queue write to arbitrary files (file:/ device URIs).
 FileDevice No
 
-# Self-signed certificate + key, created on first TLS use for ServerName, kept on the /config
-# volume so clients see the same certificate after a recreate. (CreateSelfSignedCerts defaults to
-# yes; Sandboxing keeps its compiled-in "strict" default.)
+# Self-signed certificate + key, kept on the /config volume so clients see the same certificate
+# after a recreate. docker-cups creates one for the server's name at start and links every other
+# name cupsd may look a certificate up by to it; CreateSelfSignedCerts (default yes) covers any
+# name beyond those. Sandboxing keeps its compiled-in "strict" default.
 ServerKeychain ssl
 EOF
 }

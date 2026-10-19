@@ -47,8 +47,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # The BuildKit daemon that runs the build is pinned by digest, like the actions and the
+      # Dockerfile frontend: left alone, setup-buildx-action runs moby/buildkit:buildx-stable-1, a
+      # moving tag that would change how the published image is built with no commit here.
+      # Dependabot does not bump it; NOTES.md ("Pinned build tooling") says how to.
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -76,6 +83,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           IN_FORCE: ${{ inputs.force }}
           APT_RESOLUTION_FILE: ${{ runner.temp }}/apt-resolution.txt
+          APT_BASE_FILE: ${{ runner.temp }}/apt-base.txt
         run: bash .github/scripts/gate.sh
 
       # Smoke-test BEFORE publishing. This is the only gate on the scheduled path, which is where
@@ -102,8 +110,11 @@ jobs:
             --cache-to type=gha,mode=max \
             .
 
-      # The fingerprint is a claim about the image - "it contains exactly these package versions" -
-      # so prove it before anything is tagged with it. Then take the CUPS version from the image that
+      # The fingerprint is a claim about the image - "it contains exactly these package versions, on
+      # top of the base" - so prove it, both ways, before anything is tagged with it: every resolved
+      # version is in the image, and nothing is in the image that is neither resolved nor the base's
+      # own (an install the simulation does not model would otherwise never trigger a rebuild when
+      # Ubuntu updates it). Then take the CUPS version from the image that
       # was built (its /package_versions.txt), never from a second apt query that could answer
       # differently minutes later: the published version must describe the published bytes.
       - name: Package versions and tags
@@ -111,10 +122,11 @@ jobs:
         if: steps.gate.outputs.publish == 'true'
         env:
           RESOLUTION: ${{ runner.temp }}/apt-resolution.txt
+          BASE_PKGS: ${{ runner.temp }}/apt-base.txt
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
-          bash .github/scripts/gate.sh --check-image cups:smoke "$RESOLUTION"
+          bash .github/scripts/gate.sh --check-image cups:smoke "$RESOLUTION" "$BASE_PKGS"
 
           PKGS=$(docker run --rm --entrypoint cat cups:smoke /package_versions.txt)
           VER=$(sed -n 's/^cups-daemon=//p' <<< "$PKGS")

@@ -35,7 +35,10 @@
 # packages.txt is the ONE package list: the Dockerfile installs from it and this script resolves it,
 # with the same parsing and the same validation. Parsing the Dockerfile instead would mean a regex
 # over a shell heredoc - two places to keep in step that nothing checks. --check-image then proves
-# after the build that the image really contains every version the fingerprint claims.
+# after the build, in BOTH directions, that the fingerprint describes the image: every version it
+# claims is in the image, and every package in the image is either one it claims or one the base
+# already had. (A package the build installs beyond the simulation would otherwise sit outside the
+# fingerprint, and its security updates would never trigger a rebuild.)
 #
 # A failure to resolve (archive unreachable, an unsatisfiable package set, a parse that yields
 # nothing) FAILS the job. That is deliberate: a resolution that silently came back empty would hash
@@ -51,15 +54,20 @@
 #   bash .github/scripts/gate.sh --self-test           pure helpers only: no Docker, no network
 #   bash .github/scripts/gate.sh --tags <ver> <run>    version / version_base / build_tag lines for
 #                                                      a cups-daemon package version and run number
-#   bash .github/scripts/gate.sh --check-image <image> <resolution-file>
+#   bash .github/scripts/gate.sh --check-image <image> <resolution-file> <base-file>
 #                                                      fail unless the image's /package_versions.txt
-#                                                      contains every resolved name=version
+#                                                      contains every resolved name=version AND
+#                                                      nothing that is neither resolved nor the base's
 #
 # Environment (decide mode):
 #   IMAGE               published image, e.g. ghcr.io/cookiesncache/cups (required)
-#   EVENT_NAME/IN_FORCE workflow_dispatch + force=true bypasses the fingerprint comparison
+#   EVENT_NAME/IN_FORCE workflow_dispatch + force=true bypasses the fingerprint comparison (and is
+#                       the way past a published index that cannot be read, e.g. a first publish
+#                       that GHCR answers with "denied" rather than "not found")
 #   APT_RESOLUTION_FILE optional path; the resolved name=version list is written there for
 #                       --check-image
+#   APT_BASE_FILE       optional path; the base image's own name=version list (dpkg-query, before
+#                       anything is installed) is written there for --check-image
 #   BASE_MIRROR         LOCAL TESTING ONLY. A repository (e.g. docker.io/lsiobase/ubuntu) to pull the
 #                       base from instead of the FROM line's registry, for sandboxes that cannot
 #                       reach GHCR. Only the repository is swapped: the digest still comes from the
@@ -184,6 +192,32 @@ missing_from() {
     grep -vxF -f "$have" "$want" || true
 }
 
+# unexplained <have-file> <base-file> <want-file> -> lines of have-file (the image's packages) that
+# are neither in base-file (what the pinned base already had) nor in want-file (what the fingerprint
+# resolved). Exact, whole-line matches; an empty base or want file excludes nothing.
+unexplained() {
+    local have="$1" base="$2" want="$3"
+    if [ ! -r "$have" ] || [ ! -r "$base" ] || [ ! -r "$want" ]; then
+        echo "unexplained: unreadable input" >&2
+        return 2
+    fi
+    { grep -vxF -f "$base" "$have" || true; } | { grep -vxF -f "$want" || true; }
+}
+
+# registry_says_absent <error text> -> exit 0 only when a failed registry read DEFINITELY means
+# "nothing is published under that tag" (the registry answered 404: buildx reports
+# "<ref>: not found", the distribution API "manifest unknown" / "name unknown"). Everything else -
+# 401/403 "denied", 5xx, a timeout, DNS - is "could not tell", which must never read as "nothing
+# published": that would publish, and a phantom update reaches every install.
+registry_says_absent() {
+    local line last=""
+    while IFS= read -r line; do
+        [[ "$line" =~ [^[:space:]] ]] && last="$line"
+    done <<< "$1"
+    [[ "${last,,}" =~ :[[:space:]]not[[:space:]]found[[:space:]]*$ ]] \
+        || [[ "${last,,}" =~ (manifest|name)[[:space:]_]unknown ]]
+}
+
 # ---------------------------------------------------------------------------
 # --self-test
 # ---------------------------------------------------------------------------
@@ -295,6 +329,35 @@ SIM
     printf '%s\n' 'cups-daemon=2.4.16-1ubuntu1.3x' 'curl=8.18.0-1ubuntu2.8' > "$st_dir/have3"
     eq "missing_from: whole-line match only" "$(missing_from "$st_dir/want" "$st_dir/have3")" "cups-daemon=2.4.16-1ubuntu1.3"
 
+    # ---- unexplained: the other direction of --check-image ----------------------------------------
+    # base: what the pinned base had (curl at the old version); want: the resolution (curl upgraded,
+    # cups-daemon installed); have: the image.
+    printf '%s\n' 'bash=5.3-1' 'curl=8.18.0-1ubuntu2.7' > "$st_dir/base"
+    printf '%s\n' 'bash=5.3-1' 'cups-daemon=2.4.16-1ubuntu1.3' 'curl=8.18.0-1ubuntu2.8' > "$st_dir/have4"
+    eq "unexplained: base + resolution cover the image" "$(unexplained "$st_dir/have4" "$st_dir/base" "$st_dir/want")" ""
+    printf '%s\n' 'bash=5.3-1' 'cups-daemon=2.4.16-1ubuntu1.3' 'curl=8.18.0-1ubuntu2.8' 'less=668-1build1' > "$st_dir/have5"
+    eq "unexplained: a package installed beyond the simulation" "$(unexplained "$st_dir/have5" "$st_dir/base" "$st_dir/want")" "less=668-1build1"
+    printf '%s\n' 'bash=5.3-2' 'cups-daemon=2.4.16-1ubuntu1.3' 'curl=8.18.0-1ubuntu2.8' > "$st_dir/have6"
+    eq "unexplained: a base package upgraded beyond the simulation" "$(unexplained "$st_dir/have6" "$st_dir/base" "$st_dir/want")" "bash=5.3-2"
+    : > "$st_dir/empty"
+    eq "unexplained: empty base excludes nothing" "$(unexplained "$st_dir/have4" "$st_dir/empty" "$st_dir/want" | tr '\n' ' ')" "bash=5.3-1 "
+
+    # ---- registry_says_absent: what may read as "nothing published" --------------------------------
+    absent() { # description, error text, want (yes/no)
+        local got=no
+        if registry_says_absent "$2"; then got=yes; fi
+        eq "registry error: $1" "$got" "$3"
+    }
+    absent "tag not found (buildx)"   'ERROR: ghcr.io/cookiesncache/cups:latest: not found' yes
+    absent "manifest unknown"         'ERROR: manifest unknown: manifest unknown' yes
+    absent "NAME_UNKNOWN"             'error: NAME_UNKNOWN: repository name not known to registry' yes
+    absent "denied"                   'ERROR: denied: requested access to the resource is denied' no
+    absent "anonymous token 403"      'ERROR: failed to authorize: failed to fetch anonymous token: unexpected status from GET request to https://ghcr.io/token?scope=x: 403 Forbidden' no
+    absent "repo may need auth"       'ERROR: pull access denied, repository does not exist or may require authorization: server message: insufficient_scope: authorization failed' no
+    absent "server error"             'ERROR: unexpected status code 503 Service Unavailable' no
+    absent "dns"                      'ERROR: failed to do request: Head "https://ghcr.io/v2/x/manifests/latest": dial tcp: lookup ghcr.io: no such host' no
+    absent "empty"                    '' no
+
     if [ "$st_fail" != 0 ]; then
         echo "::error::gate.sh self-test failed"
         exit 1
@@ -334,36 +397,59 @@ if [ "${1:-}" = "--tags" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# --check-image <image> <resolution file>
+# --check-image <image> <resolution file> <base file>
 #
-# The fingerprint is a claim about the image: "it contains exactly these package versions". Prove
-# it before anything is published. A mismatch means one of two things, and neither may ship under
-# this fingerprint's annotation:
-#   - the gate's simulation does not model the Dockerfile's apt step any more (a parse or flag
-#     drift) - a silent-staleness bug that this check turns into a red run;
+# The fingerprint is a claim about the image: "it contains exactly these package versions, on top
+# of the pinned base". Prove it, both ways, before anything is published:
+#   - every resolved name=version is in the image;
+#   - every name=version in the image is either resolved or the base's own (unchanged) package.
+#     Without this direction, a package the build installs beyond the simulation - an extra
+#     `apt-get install` added to the Dockerfile outside packages.txt, or an `apt-get upgrade` of
+#     apt itself changing the install step's solver - would pass, and stay outside the fingerprint:
+#     its security updates would never trigger a rebuild.
+# A mismatch means one of two things, and neither may ship under this fingerprint's annotation:
+#   - the gate's simulation does not model the Dockerfile's apt step any more (a parse, flag or
+#     install drift) - a silent-staleness bug that this check turns into a red run;
 #   - Ubuntu published between the gate and the build (minutes; rare). Re-running the workflow
 #     resolves it, and is cheaper than an annotation that lies about the content.
 # ---------------------------------------------------------------------------
 if [ "${1:-}" = "--check-image" ]; then
-    img="${2:?usage: gate.sh --check-image <image> <resolution-file>}"
-    want="${3:?usage: gate.sh --check-image <image> <resolution-file>}"
+    usage="usage: gate.sh --check-image <image> <resolution-file> <base-file>"
+    img="${2:?$usage}"
+    want="${3:?$usage}"
+    base="${4:?$usage}"
     [ -s "$want" ] || { echo "::error::resolution file '${want}' is missing or empty" >&2; exit 1; }
+    [ -s "$base" ] || { echo "::error::base package file '${base}' is missing or empty" >&2; exit 1; }
     have="$(mktemp)"
     trap 'rm -f "$have"' EXIT
     if ! docker run --rm --entrypoint cat "$img" /package_versions.txt > "$have" || [ ! -s "$have" ]; then
         echo "::error::could not read /package_versions.txt from ${img}" >&2
         exit 1
     fi
+    bad=0
     missing="$(missing_from "$want" "$have")"
     if [ -n "$missing" ]; then
         echo "::error::${img} does not contain the package versions its fingerprint was computed from:"
         while IFS= read -r line; do
             printf '  resolved %-48s image has %s\n' "$line" "$(grep -m1 "^${line%%=*}=" "$have" || echo '(not installed)')"
         done <<< "$missing"
+        bad=1
+    fi
+    extra="$(unexplained "$have" "$base" "$want")"
+    if [ -n "$extra" ]; then
+        echo "::error::${img} contains package versions that are neither in its fingerprint nor in the base:"
+        while IFS= read -r line; do
+            other="$(grep -h -m1 "^${line%%=*}=" "$want" "$base" | sed -n 1p || true)"
+            printf '  image has %-47s fingerprint/base: %s\n' "$line" \
+                "${other:-(never resolved - installed outside packages.txt?)}"
+        done <<< "$extra"
+        bad=1
+    fi
+    if [ "$bad" != 0 ]; then
         echo "If Ubuntu published during this run, re-run the workflow; otherwise the gate's simulation no longer matches the Dockerfile's apt step."
         exit 1
     fi
-    echo "::notice::${img} contains all $(wc -l < "$want") resolved package versions"
+    echo "::notice::${img} contains all $(wc -l < "$want") resolved package versions, and nothing beyond them and the base's own $(wc -l < "$base")"
     exit 0
 fi
 
@@ -403,17 +489,26 @@ mapfile -t PKGS <<< "$PKG_TEXT"
 # progress goes to stderr so stdout carries only the simulation. Error-Mode=any makes a partially
 # failed update (one unreachable pocket) an error instead of a resolution against stale indexes. The
 # package names travel as positional arguments, never through a shell string.
+# The base's own package list comes first, tagged "BASE ": --check-image needs it to tell the base's
+# untouched packages from ones the build added. (apt_inst_versions only reads "Inst " lines.)
 echo "Resolving ${#PKGS[@]} packages from ${PACKAGES_FILE} inside ${RESOLVE_REF} ..."
+# shellcheck disable=SC2016 # the script runs, and expands, inside the container
 if ! SIM="$(docker run --rm --platform linux/amd64 --entrypoint /bin/bash \
                 -v "${PWD}/${APT_PIN_FILE}:${APT_PIN_TARGET}:ro" \
                 "$RESOLVE_REF" -c '
                     set -euo pipefail
                     export DEBIAN_FRONTEND=noninteractive
+                    dpkg-query -W -f="BASE \${Package}=\${Version}\n"
                     apt-get -qq -o APT::Update::Error-Mode=any update >&2
                     apt-get -s -y upgrade
                     apt-get -s -y install --no-install-recommends "$@"
                 ' resolve "${PKGS[@]}")"; then
     echo "::error::could not resolve the package set inside ${RESOLVE_REF} - the gate cannot tell whether Ubuntu published anything"
+    exit 1
+fi
+BASE_PKGS="$(printf '%s\n' "$SIM" | sed -n 's/^BASE //p' | LC_ALL=C sort -u)"
+if ! valid_resolution "$BASE_PKGS"; then
+    echo "::error::could not read the base image's own package list (dpkg-query) - --check-image would have nothing to compare against"
     exit 1
 fi
 
@@ -431,6 +526,9 @@ fi
 if [ -n "${APT_RESOLUTION_FILE:-}" ]; then
     printf '%s\n' "$RESOLUTION" > "$APT_RESOLUTION_FILE"
 fi
+if [ -n "${APT_BASE_FILE:-}" ]; then
+    printf '%s\n' "$BASE_PKGS" > "$APT_BASE_FILE"
+fi
 
 APT_FINGERPRINT="$(printf '%s\n' "$RESOLUTION" | sha256sum | cut -c1-16)"
 if ! REPO_REVS="$(git rev-parse HEAD:Dockerfile HEAD:root HEAD:.dockerignore 2>&1)"; then
@@ -440,18 +538,53 @@ fi
 REPO_INPUTS="$(printf '%s\n' "$REPO_REVS" | sha256sum | cut -c1-16)"
 HASH="$(printf '%s\n%s\n' "$REPO_INPUTS" "$APT_FINGERPRINT" | sha256sum | cut -c1-16)"
 
-# One registry read: the annotations on the published index. Nothing published yet (or not
-# readable) reads as "no fingerprint", which publishes.
-PUB_RAW="$(docker buildx imagetools inspect "${IMAGE}:latest" --raw 2>/dev/null || printf '{}')"
-jq_ann() { printf '%s' "$PUB_RAW" | jq -r ".annotations[\"$1\"] // \"\"" 2>/dev/null || printf ''; }
-PUBLISHED="$(jq_ann 'io.cookiesncache.inputs')"
-PUB_APT="$(jq_ann 'io.cookiesncache.cups.apt.fingerprint')"
-PUB_VER="$(jq_ann 'org.opencontainers.image.version')"
-
 FORCE_PUBLISH=false
 if [ "${EVENT_NAME:-}" = "workflow_dispatch" ] && [ "${IN_FORCE:-false}" = "true" ]; then
     FORCE_PUBLISH=true
 fi
+
+# One registry read: the annotations on the published index.
+#
+# Only a definite "not found" (registry_says_absent) means "nothing published yet", which publishes.
+# Any OTHER failure - a 403, a 5xx, a timeout - is retried and then FAILS the run: treating "could
+# not read" as "no fingerprint" would publish an image that differs from the live one only in
+# BUILD_DATE, with a new immutable -ls tag - a phantom update on every Unraid install, which is
+# exactly what this gate exists to prevent. A red day costs nothing; the next run decides again.
+# (A first publish that GHCR answers with "denied" instead of "not found" goes through a manual
+# run with force=true, which skips the comparison - and so does not need the read.)
+PUB_RAW=""
+PUB_STATE=""
+pub_err=""
+pub_errf="$(mktemp)"
+trap 'rm -f "$pub_errf"' EXIT
+for attempt in 1 2 3; do
+    if PUB_RAW="$(docker buildx imagetools inspect "${IMAGE}:latest" --raw 2>"$pub_errf")"; then
+        PUB_STATE=published
+        break
+    fi
+    pub_err="$(cat "$pub_errf")"
+    if registry_says_absent "$pub_err"; then
+        PUB_RAW='{}'
+        PUB_STATE=absent
+        break
+    fi
+    echo "::warning::reading ${IMAGE}:latest failed (attempt ${attempt}/3): $(printf '%s' "$pub_err" | tail -n1)"
+    [ "$attempt" = 3 ] || sleep $((attempt * 15))
+done
+if [ -z "$PUB_STATE" ]; then
+    if [ "$FORCE_PUBLISH" = "true" ]; then
+        echo "::warning::could not read the published fingerprint of ${IMAGE}:latest - publishing anyway because force=true"
+        PUB_RAW='{}'
+        PUB_STATE=unreadable
+    else
+        echo "::error::could not read the published fingerprint of ${IMAGE}:latest, so the gate cannot tell whether anything changed. Not publishing: an unneeded push would be a phantom update for every install. If this is the very first publish and the registry refuses rather than answering 'not found', run the workflow manually with force=true."
+        exit 1
+    fi
+fi
+jq_ann() { printf '%s' "$PUB_RAW" | jq -r ".annotations[\"$1\"] // \"\"" 2>/dev/null || printf ''; }
+PUBLISHED="$(jq_ann 'io.cookiesncache.inputs')"
+PUB_APT="$(jq_ann 'io.cookiesncache.cups.apt.fingerprint')"
+PUB_VER="$(jq_ann 'org.opencontainers.image.version')"
 
 if [ "$FORCE_PUBLISH" != "true" ] && [ -n "$PUBLISHED" ] && [ "$PUBLISHED" = "$HASH" ]; then
     PUBLISH=false
@@ -460,8 +593,12 @@ else
 fi
 
 # Say WHICH input moved, so a publish is never a mystery in the log.
-if [ -z "$PUBLISHED" ]; then
-    WHY="nothing published yet (or the published index is unreadable)"
+if [ "$PUB_STATE" = absent ]; then
+    WHY="nothing published yet (${IMAGE}:latest not found)"
+elif [ "$PUB_STATE" = unreadable ]; then
+    WHY="forced; the published index could not be read"
+elif [ -z "$PUBLISHED" ]; then
+    WHY="the published index carries no io.cookiesncache.inputs annotation"
 elif [ "$PUBLISHED" = "$HASH" ]; then
     WHY="no input changed${FORCE_PUBLISH:+ (force=${FORCE_PUBLISH})}"
 elif [ -n "$PUB_APT" ] && [ "$PUB_APT" != "$APT_FINGERPRINT" ]; then

@@ -18,7 +18,9 @@ services:
       - TZ=America/New_York
       # Remote administration (web UI /admin, https only) stays OFF unless both are set.
       # Put the password in a .env file next to this one (git-ignored), or use a Docker secret
-      # with FILE__CUPS_ADMIN_PASSWORD=/run/secrets/<name> instead.
+      # with FILE__CUPS_ADMIN_PASSWORD=/run/secrets/<name> instead - its source file root-owned
+      # and 0600, or the print filters (user lp) can read it (the log warns).
+      # The web interface: https://<host>:631/ (self-signed certificate - accept it once).
       - CUPS_ADMIN_USER=${CUPS_ADMIN_USER:-}
       - CUPS_ADMIN_PASSWORD=${CUPS_ADMIN_PASSWORD:-}
       # Host names you type in the browser besides IP addresses / localhost / *.local

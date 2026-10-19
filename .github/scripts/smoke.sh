@@ -17,7 +17,8 @@
 #             (stale pid files; queue auto-create idempotent; Letter kept), and the IPP Everywhere
 #             path into ippeveprinter (which needs the D-Bus system bus this container provides).
 #   guard-*   a host directory bind-mounted at /run/dbus or /var/run/dbus (what the old template
-#             did): must refuse to start, and must not touch the mounted files.
+#             did), or a non-tmpfs volume over /run itself: must refuse to start, and must not
+#             touch the mounted files.
 #   bad-*     invalid access-control input: must refuse to start.
 #   peer      a client on the same docker network, made from the image under test - curl, lp and
 #             python3 are already in it. Nothing else is pulled, so no floating helper image can
@@ -44,10 +45,12 @@ NARROW="${BASE}-narrow"
 AIRPRINT="${BASE}-airprint"
 GUARD_RUN="${BASE}-guard-run"
 GUARD_VARRUN="${BASE}-guard-varrun"
+GUARD_HOSTRUN="${BASE}-guard-hostrun"
+RUNVOL="${BASE}-runvol"   # a named (disk-backed, not tmpfs) volume standing in for a host /run
 BAD_ALL="${BASE}-bad-all"
 BAD_NL="${BASE}-bad-newline"
 PEER="${BASE}-peer"
-CONTAINERS=("$MAIN" "$NOADMIN" "$NARROW" "$AIRPRINT" "$GUARD_RUN" "$GUARD_VARRUN" "$BAD_ALL" "$BAD_NL" "$PEER")
+CONTAINERS=("$MAIN" "$NOADMIN" "$NARROW" "$AIRPRINT" "$GUARD_RUN" "$GUARD_VARRUN" "$GUARD_HOSTRUN" "$BAD_ALL" "$BAD_NL" "$PEER")
 
 QUEUE=M203
 M203_MODEL='postscript-hp:0/ppd/hplip/HP/hp-laserjet_pro_m203_m206-ps.ppd'
@@ -62,6 +65,7 @@ HOSTDBUS="$(mktemp -d)"
 cleanup() {
     docker rm -f "${CONTAINERS[@]}" >/dev/null 2>&1 || true
     docker network rm "$NET" >/dev/null 2>&1 || true
+    docker volume rm "$RUNVOL" >/dev/null 2>&1 || true
     rm -rf "$HOSTDBUS" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -239,6 +243,35 @@ while True:
     c.close()
 '
 
+# One IPP operation from the peer, Basic credentials sent UP FRONT (not in answer to a challenge) -
+# what a script or a misconfigured client does. Prints "<HTTP status> <IPP status>".
+IPP_OP='
+import base64, http.client, ssl, struct, sys
+scheme, host, op, path, auth = sys.argv[1], sys.argv[2], int(sys.argv[3], 16), sys.argv[4], sys.argv[5]
+def attr(tag, name, value):
+    n, v = name.encode(), value.encode()
+    return bytes([tag]) + struct.pack(">H", len(n)) + n + struct.pack(">H", len(v)) + v
+body = (struct.pack(">BBHI", 2, 0, op, 1) + b"\x01"
+        + attr(0x47, "attributes-charset", "utf-8")
+        + attr(0x48, "attributes-natural-language", "en")
+        + attr(0x45, "printer-uri", "ipp://localhost" + path) + b"\x03")
+if scheme == "https":
+    c = http.client.HTTPSConnection(host, 631, context=ssl._create_unverified_context(), timeout=20)
+else:
+    c = http.client.HTTPConnection(host, 631, timeout=20)
+c.request("POST", path, body, {"Content-Type": "application/ipp",
+                               "Authorization": "Basic " + base64.b64encode(auth.encode()).decode()})
+r = c.getresponse()
+data = r.read()
+print(r.status, "0x%04x" % struct.unpack(">H", data[2:4])[0] if r.status == 200 and len(data) >= 4 else "-")
+'
+
+# Subject and SHA-256 fingerprint of the certificate served on <host>:631, as the peer sees it
+# (direct TLS, so no Host: header is involved).
+peer_cert() { # <host>
+    docker exec "$PEER" sh -c "echo | timeout 10 openssl s_client -connect '$1:631' 2>/dev/null | openssl x509 -noout -subject -fingerprint -sha256" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # Start everything
 # ---------------------------------------------------------------------------
@@ -262,6 +295,10 @@ printf 'host-socket-sentinel\n' > "${HOSTDBUS}/system_bus_socket"
 printf '4242\n' > "${HOSTDBUS}/pid"
 start "$GUARD_RUN" -v "${HOSTDBUS}:/run/dbus"
 start "$GUARD_VARRUN" -v "${HOSTDBUS}:/var/run/dbus" -e CUPS_AIRPRINT=true
+# A host directory over the whole /run hides the host's bus BELOW the mount point. A named volume
+# (disk-backed, not tmpfs) stands in for it, so the runner never gets root-owned files from s6.
+docker volume create "$RUNVOL" >/dev/null
+start "$GUARD_HOSTRUN" -v "${RUNVOL}:/var/run" -e CUPS_AIRPRINT=true
 start "$BAD_ALL" -e CUPS_ALLOWED_NETWORKS=all
 start "$BAD_NL" -e "CUPS_SERVER_ALIASES=tower"$'\n'"ServerAlias *"
 
@@ -327,8 +364,25 @@ section_main() {
     expect_eq "/admin over https, admin credentials -> 200"     "$(peer_code -u "${ADMIN_USER}:${ADMIN_PASS}" "https://${ip}:631/admin")" 200
     expect_eq "Host header that is not an alias -> 400"         "$(peer_code -H 'Host: rebind.example' "http://${ip}:631/")" 400
 
+    # One certificate, named after the stable server name: this container's hostname is Docker's
+    # random ID, so that is the "unraid-cups" fallback - on the container's address AND on localhost
+    # (cupsd would otherwise mint one named after the reverse lookup of each address).
+    out="$(peer_cert "$ip")"
+    expect "certificate on the container IP is CN=unraid-cups (not the container ID)" 'CN ?= ?unraid-cups(,|$)' "$out"
+    expect_eq "the same certificate on the container IP and on localhost" \
+        "$(sed -n 's/^sha256 Fingerprint=//Ip' <<< "$out")" \
+        "$(cx "$MAIN" sh -c 'echo | timeout 10 openssl s_client -connect 127.0.0.1:631 2>/dev/null | openssl x509 -noout -fingerprint -sha256' 2>/dev/null | sed -n 's/^sha256 Fingerprint=//Ip')"
+
     wait_queue "$MAIN" "$QUEUE" || return 0
     wait_listening "$MAIN" 238C || bad "the raw TCP listener on 127.0.0.1:9100 never came up"
+
+    # A password-protected IPP operation with GOOD credentials sent up front: refused over plain http
+    # (426, so the password is never accepted in cleartext), accepted over TLS. CUPS-Accept-Jobs on
+    # a queue that already accepts jobs changes nothing.
+    expect_eq "IPP admin op over plain http, good credentials sent up front -> 426" \
+        "$(docker exec "$PEER" python3 -c "$IPP_OP" http "$ip" 4008 "/printers/${QUEUE}" "${ADMIN_USER}:${ADMIN_PASS}" 2>&1 || true)" "426 -"
+    expect_eq "IPP admin op over TLS, good credentials -> successful-ok" \
+        "$(docker exec "$PEER" python3 -c "$IPP_OP" https "$ip" 4008 "/printers/${QUEUE}" "${ADMIN_USER}:${ADMIN_PASS}" 2>&1 || true)" "200 0x0000"
 
     # Printing from another container on the same network, allowed by the default
     # CUPS_ALLOWED_NETWORKS (the docker network is inside 172.16.0.0/12 / 10.0.0.0/8 / 192.168.0.0/16).
@@ -426,6 +480,7 @@ section_airprint() {
     expect    "auto-created queue retries jobs"        '^ErrorPolicy retry-job$'  "$pc"
     expect_eq "auto-created queue defaults to Letter"  "$(default_pagesize "$AIRPRINT" "$QUEUE")" Letter
     if discover; then pass "queue discoverable via ippfind _ipp._tcp,_universal with URF"; else bad "queue not discoverable via ippfind _ipp._tcp,_universal"; fi
+    expect "certificate CN is the --hostname (${AP_HOST})" "CN ?= ?${AP_HOST}(,|\$)" "$(peer_cert "$(ip_of "$AIRPRINT")")"
 
     # s6-overlay v3 does not wipe /run on `docker restart`, so the dbus and avahi pid files from the
     # first boot are still there. The restart must cope with them, and must not recreate the queue.
@@ -513,6 +568,7 @@ section_refusals() {
         "$(cat "${HOSTDBUS}/system_bus_socket" "${HOSTDBUS}/pid" 2>&1 || true)" "$(printf 'host-socket-sentinel\n4242')"
     listing="$(cd "$HOSTDBUS" && ls -A)"
     expect_eq "nothing was added to the mounted host directory" "$(tr '\n' ' ' <<< "$listing")" "pid system_bus_socket "
+    refuses "$GUARD_HOSTRUN" "non-tmpfs volume mounted over /var/run (AirPrint on)" 'host directory is mounted over'
     refuses "$BAD_ALL"      "CUPS_ALLOWED_NETWORKS=all"                "refusing to start"
     refuses "$BAD_NL"       "newline injected into CUPS_SERVER_ALIASES" "refusing to start"
     logs="$(docker logs "$BAD_ALL" 2>&1 || true)"
@@ -532,4 +588,4 @@ if [ "$fail" != 0 ]; then
     exit 1
 fi
 
-echo "::notice::smoke test passed (posture, /admin over http+https, peer printing allowed and refused per CUPS_ALLOWED_NETWORKS, M203 PJL/PostScript chain, IPP Everywhere, AirPrint discovery across restart, queue idempotency, D-Bus guard and fail-closed input)"
+echo "::notice::smoke test passed (posture, /admin over http+https, peer printing allowed and refused per CUPS_ALLOWED_NETWORKS, M203 PJL/PostScript chain, IPP Everywhere, AirPrint discovery across restart, queue idempotency, one stable TLS certificate, TLS-only admin IPP, D-Bus and /run guards, fail-closed input)"

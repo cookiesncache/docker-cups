@@ -44,13 +44,18 @@ jobs:
         run: bash .github/scripts/lint.sh
 
       # The gate's pure helpers: packages.txt parsing (identical to the Dockerfile's), the apt
-      # simulation parser that the package fingerprint hangs on, the FROM-line digest check, and the
-      # version/tag derivation. No registry, no Docker, no network.
+      # simulation parser that the package fingerprint hangs on, the FROM-line digest check, the
+      # version/tag derivation, both directions of --check-image, and which registry errors may read
+      # as "nothing published". No registry, no Docker, no network.
       - name: Gate self-test
         run: bash .github/scripts/gate.sh --self-test
 
+      # Same pinned BuildKit as build.yml, so a PR is built the way the published image will be.
       - name: Set up Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          driver-opts: |
+            image=moby/buildkit:v0.33.1@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea
 
       # No registry login: the LSIO base is public, so anonymous pulls suffice. Dependabot-triggered
       # runs get a read-only token and no secrets, and this job needs neither. The build's only

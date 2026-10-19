@@ -158,14 +158,32 @@ never invalidate the cached layers.
   as `lp`. So `/config/cups` is **never** `lsiown -R`'d; only `/config` itself follows `PUID`/`PGID`
   (the base does that, non-recursively). Each boot applies a targeted, non-recursive repair
   (`chown -h`, regular files only, no symlink following): `/config/cups` 0755, `ppd/` 0755, `ssl/`
-  0700, `printers.conf`/`classes.conf` 0600, `ppd/*.ppd` 0640. This undoes Unraid's *New
-  Permissions* tool or files dropped in from the host, without handing anything to `PUID`/`PGID`.
+  0700, `ssl/*.key` 0600 `root:root`, `printers.conf`/`classes.conf` 0600, `ppd/*.ppd` 0640. This
+  undoes Unraid's *New Permissions* tool or files dropped in from the host, without handing anything
+  to `PUID`/`PGID`.
+- **Symlinks are refused, not adopted.** `/config` belongs to `PUID`/`PGID`, so whoever owns it can,
+  while the container is stopped, swap in a `/config/cups` of their own whose `ppd/` or `ssl/` points
+  anywhere. `chmod` follows symlinks (`chown -h` does not), and cupsd would keep its PPDs or TLS keys
+  at the link's target. So `/config/cups`, `ppd/` and `ssl/` must be real directories, or the
+  container stops with an error (found in review: a planted `ssl -> /etc/ssl/private` had its target
+  chmod'ed).
+- **umask.** `with-contenv` applies the LSIO `UMASK` to every service, and Unraid users often set
+  `000`. It is meant for files written for `PUID`/`PGID`; cupsd writes none, but creates TLS keys with
+  whatever umask it inherits (`UMASK=000` gave a 0666 key). `svc-cups` sets `umask 022` before
+  `exec cupsd`, and the per-boot repair above re-locks any key.
 - **Spool and cache** (`/var/spool/cups`, `/var/cache/cups`) stay in the container layer.
 - **Migration** from the old template: if `/config/printers.conf` or `/config/ppd/` exists at the
   **top** of `/config` and `/config/cups/printers.conf` does not, copy `printers.conf`,
   `classes.conf` and `ppd/*.ppd` in (never the old `cupsd.conf`, `cups-files.conf` or `ssl/`), log
   each file with a `MIGRATION:` prefix, leave the originals untouched, and write
   `/config/cups/.imported-from-old-template` so it happens once.
+- **Imported queues on a backend this image lacks** (HPLIP's `hp:/`, the web UI's `dnssd://` for
+  discovered printers, `lpd://`, `serial:` …): cupsd stops such a queue as it loads ("Backend … does
+  not exist!", `State Stopped` in `printers.conf`), and that stop outlives fixing the URI. The
+  migration logs a `WARN` per such queue (scheme only — a URI may carry credentials). When
+  `PRINTER_NAME` names that queue and `init-cups-queue` gives it a usable URI, it also runs
+  `cupsenable` — but only for a queue stopped with that exact "Backend … does not exist" reason and
+  whose new scheme has a backend, so a queue the user paused stays paused.
 
 ## s6 layout
 
@@ -180,8 +198,8 @@ Under `root/etc/s6-overlay/s6-rc.d/`, all in the `user` bundle:
 | `init-cups-queue` | oneshot | `svc-cups` |
 
 - **`init-cups-config`** (oneshot): host D-Bus guard → validate every variable → seed/migrate/repair
-  `/config/cups` → admin account → generate `cupsd.conf`/`cups-files.conf` → AirPrint
-  `avahi-daemon.conf` → stale pid cleanup → security-posture summary. Everything below it depends on
+  `/config/cups` → admin account → generate `cupsd.conf`/`cups-files.conf` → TLS identity (below) →
+  AirPrint `avahi-daemon.conf` → stale pid cleanup → security-posture summary. Everything below it depends on
   it through `init-config-end`, so cupsd never starts on bad input.
 - **`svc-dbus`** (longrun): with AirPrint on, a **private** system bus:
   `dbus-daemon --system --nofork --nopidfile --nosyslog --print-address=3` with `notification-fd` = 3.
@@ -193,8 +211,9 @@ Under `root/etc/s6-overlay/s6-rc.d/`, all in the `user` bundle:
   image has no `/etc/machine-id`.
 - **`svc-avahi`** (longrun): `avahi-daemon --no-proc-title`, foreground, default privilege drop and
   chroot (no capabilities beyond Docker's defaults). Idles like svc-dbus when AirPrint is off.
-- **`svc-cups`** (longrun): `exec cupsd -f` as root — never `-l`, where the stock `IdleExitTimeout`
-  would make it exit when idle. No readiness signal is possible for an exec'd cupsd.
+- **`svc-cups`** (longrun): `umask 022`, then `exec cupsd -f` as root — never `-l`, where the stock
+  `IdleExitTimeout` would make it exit when idle. No readiness signal is possible for an exec'd
+  cupsd.
 - **`init-cups-queue`** (oneshot): polls `lpstat -r` for up to 30 s, then the optional `PRINTER_*`
   auto-create. It **always exits 0**: an unplugged printer must never block the print server.
 - **`init-adduser/branding`**: the "docker-cups · UNOFFICIAL" banner, kept by `LSIO_FIRST_PARTY=false`.
@@ -222,11 +241,26 @@ waiter: `s6-svwait -U -t 60000 svc-dbus && s6-svc -h svc-cups`. Verified with
 with the very PID its stale file named). They are removed before start — but only after the host
 D-Bus guard has passed.
 
-**Host D-Bus guard.** Reads `/proc/self/mountinfo` for anything mounted at or below `/run/dbus` or
-`/var/run/dbus` (a single bind-mounted `system_bus_socket` counts) and refuses to start, deleting
-nothing. Running our own dbus-daemon on top of the host's would unlink the host's socket, and a
-working host bus would hand every process here — print filters included — the host's system bus.
-Runs first in `init-cups-config` and again in `svc-dbus`.
+**Host D-Bus guard** (`cups-dbus-guard`). Running our own dbus-daemon on top of the host's would
+unlink the host's socket — after which host processes connecting to the system bus would reach the
+container's bus — and a working host bus would hand every process here, print filters included, the
+host's system bus. Three read-only checks; any hit refuses to start, deleting nothing:
+
+1. anything mounted at or below `/run/dbus` or `/var/run/dbus` (from `/proc/self/mountinfo`; a
+   single bind-mounted `system_bus_socket` counts) — the old template's mapping;
+2. a mount exactly at `/run` (Docker resolves `/var/run` to it) that is **not** a tmpfs — a host
+   directory there. A default container has no mount at `/run`, and the `--read-only` recipe uses
+   `--tmpfs /run`, which passes;
+3. a `system_bus_socket` or Avahi socket that **accepts** a connection (`s6-ipcclient … true`). The
+   host's own `/run` is a tmpfs, so a bind of it passes check 2; but our daemons are never running
+   when the guard runs (`init-cups-config` precedes them; `svc-dbus` runs it only after its previous
+   dbus-daemon exited), so a live bus can only be someone else's.
+
+Checks 2 and 3 came out of review: a bind of the host's `/run` hid the bus below a mount the first
+check never looked at, and the container then replaced the host's live bus socket with its own.
+Runs first in `init-cups-config` and again in `svc-dbus`. Verified after `pkill -KILL dbus-daemon`:
+the restarted `svc-dbus` passes the guard (avahi exits with the bus, so its socket is dead too) and
+DNS-SD comes back.
 
 ## Generated configuration
 
@@ -244,7 +278,7 @@ optional `HostNameLookups Double`, `DefaultPaperSize`, `WebInterface`, `Browsing
 `DefaultEncryption Required`, `<Location />` (allow localhost + `CUPS_ALLOWED_NETWORKS`),
 `<Location /admin|/admin/conf|/admin/log>` (`AuthType Default`, `Require user @SYSTEM`, `Encryption
 Required`, localhost + `CUPS_ADMIN_NETWORKS` only when an admin is configured), then Ubuntu's three
-policy blocks verbatim.
+policy blocks verbatim — plus one line, below.
 
 `cups-files.conf`: `SystemGroup lpadmin root`, `AccessLog`/`ErrorLog`/`PageLog stderr`,
 `FileDevice No`, `ServerKeychain ssl`; `Sandboxing` and `CreateSelfSignedCerts` keep their compiled-in
@@ -257,6 +291,18 @@ Decisions that differ from the obvious choice, with the reason each was tested:
   http and the client sends Basic credentials in cleartext. `Required` turns every non-local
   unencrypted 401 into a `426` redirect to https. `/admin` behaviour (http 426, https 401/200) is
   unchanged.
+- **`Encryption Required` added under every `AuthType Default`/`Basic` in the policies.**
+  `DefaultEncryption` only rewrites a 401 *challenge*; a client that sends Basic credentials up front
+  over plain http got them accepted — review showed `CUPS-Add-Modify-Printer` on `/printers/x`
+  succeeding over http from an address `CUPS_ADMIN_NETWORKS` excluded. The line is inserted while
+  rendering (an `awk` pass over the extracted policies, which fails the boot if it finds no such
+  `<Limit>`), so the rest of Ubuntu's policy stays byte-for-byte. Verified: plain-http
+  `CUPS-Accept-Jobs`/`Pause-Printer` with good credentials → 426; over TLS → 200 (bad password 401);
+  `docker exec … lpadmin`/`cupsenable` as root over the domain socket still work. **Not** closed: the
+  web interface's printer pages (`POST /printers/NAME`, `op=stop-printer`). The CGI re-issues the
+  operation over the local socket, so credentials sent unasked over http to that page still work.
+  The only lever would be encryption on `POST /printers`, which is also how every IPP client prints —
+  so it is documented (use https) instead.
 - **`SystemGroup lpadmin root`.** cupsd's `@SYSTEM` check has no root bypass: with `lpadmin` alone,
   `docker exec <c> lpadmin …` (root over the domain socket) returned `lpadmin: Forbidden`. Ubuntu's
   stock file lists root too. Remote root login stays impossible: root's password is locked and
@@ -267,15 +313,41 @@ Decisions that differ from the obvious choice, with the reason each was tested:
 - **`HostNameLookups Double` when a name is used in an Allow list.** cupsd matches name rules only
   after a reverse lookup; with the default `Off` such tokens would silently never match. `Double`
   also checks the forward lookup.
-- **An explicit `ServerName`, always.** It is the TLS keychain CN, so the certificate stays the same
-  across recreates even without `--hostname` (verified: same SHA-256 fingerprint). Docker's default
-  hostname is the container ID, which changes on every recreate — iOS would then report changed
-  credentials — so a 12-hex-character hostname (or one that is not a valid DNS label) falls back to
-  `unraid-cups`. In AirPrint mode it is `<name>.local`. An explicit `ServerName` disables cupsd's
-  automatic hostname alias, so the bare name and the container hostname are re-added as
-  `ServerAlias` (otherwise `http://unraid-cups:631/` would get a 400).
+- **An explicit `ServerName`, always,** and a stable one: Docker's default hostname is the container
+  ID, which changes on every recreate, so a 12-hex-character hostname (or one that is not a valid
+  DNS label) falls back to `unraid-cups`. In AirPrint mode it is `<name>.local`. An explicit
+  `ServerName` disables cupsd's automatic hostname alias, so the bare name and the container hostname
+  are re-added as `ServerAlias` (otherwise `http://unraid-cups:631/` would get a 400).
 - **`ServerTokens None`** removes the `Server:` header. CUPS' built-in HTML error pages still carry
   `CUPS v2.4.16` in their `<title>` (compiled in, not configurable).
+
+### The TLS identity
+
+`ServerName` does **not** decide which certificate cupsd serves. With GnuTLS (Ubuntu's build),
+`_httpTLSStart` names the keychain files after the reverse lookup of the address the client
+connected **to** — in Docker, `/etc/hosts` maps that to the container hostname — and falls back to
+`ServerName` only for a localhost connection or a looked-up name starting with a digit. Found in
+review: without `--hostname`, a container ID starting with a–f got its own certificate on every
+recreate (the "same fingerprint" an earlier test saw was an ID that happened to start with a digit),
+`CUPS_AIRPRINT_HOSTNAME` never became the CN, and one container served two certificates (one on its
+IP, one on localhost).
+
+So `init-cups-config` makes **one** certificate, `ssl/<name>.crt/.key` (`<name>` = the
+`CUPS_AIRPRINT_HOSTNAME`/hostname/fallback above), once, the way cupsd would (RSA-2048, SHA-256,
+10 years, CN = the name, plus SANs `<name>`, `<name>.local`, `localhost`), and makes every other name
+cupsd may look up — `ServerName` and the reverse-lookup name of each container address — a relative
+symlink to it. A certificate cupsd made earlier under one of those names is kept as `*.replaced` and
+restored if that name becomes the stable one again; links for names that no longer apply are removed
+(only links of exactly that shape, never a regular file). If any of it fails, cupsd simply creates
+its own certificates as before, so it only warns. Verified: same CN and fingerprint on the container
+IP and on localhost, across recreates with and without `--hostname`, and the CN follows
+`CUPS_AIRPRINT_HOSTNAME`.
+
+Not covered: a client that upgrades a plain-http connection to TLS (`OPTIONS` + `Upgrade: TLS`, which
+libcups does after a 426) gets a certificate named after its `Host:` header, port included
+(`tower:631` → `ssl/tower_631.crt`), created on first use. Browsers and AirPrint clients connect with
+TLS directly and are not affected; the open-ended set of `Host:` values (any port, any `*.local`) is
+why those are not pre-linked.
 
 ### Validation
 
@@ -288,8 +360,11 @@ collected and printed together, values `%q`-escaped so an injected newline canno
 - Allow tokens: `@LOCAL`, `@IF(name)`, IPv4 `a.b.c.d[/1-32]` (no leading zeros, no partial
   shorthands, no dotted netmasks), IPv6 `[addr][/1-128]` (RFC 4291 forms), `localhost`, host names,
   `*.domain` / `.domain`. Refused: `all`, `none`, `*`, `any`, `everyone`, `/0`, names starting with a
-  digit (cupsd would parse them as addresses). Tokens are normalised and de-duplicated; `localhost`
-  is always first.
+  digit (cupsd would parse them as addresses), and IPv6 networks that contain `::/96` (`[::]/1` …
+  `[::]/96`, `[::]/64`): cupsd stores every IPv4 client and IPv4 mask as the IPv4-compatible address
+  `::a.b.c.d`, so such a token — IPv6-looking in `cupsd.conf` and in the log — admits every IPv4
+  client (verified: `[::]/1` let an IPv4 peer in). Tokens are normalised and de-duplicated;
+  `localhost` is always first.
 - `CUPS_SERVER_ALIASES`: dotted DNS names; `*` refused (it disables the Host-header check, which is
   cupsd's DNS-rebinding defence).
 - Enumerations: paper size (Letter, Legal, Executive, Tabloid, Statement, A3–A6 — names that are the
@@ -301,6 +376,12 @@ collected and printed together, values `%q`-escaped so an injected newline canno
   `[A-Za-z][A-Za-z0-9._-]{0,63}`, value 1–255 chars without whitespace, quotes, backslash or backtick,
   each passed as one `-o` argv element. Nothing is ever `eval`'d, sourced or word-split from the
   environment.
+- `PRINTER_URI` may carry a network printer's credentials (`ipps://user:pass@host/…`), and docker
+  logs are what people paste into issues: every log line shows it with the userinfo replaced by
+  `***` (everything up to the last `@`). CUPS reports device URIs with the userinfo stripped
+  (`lpstat -v`), so the "has the URI changed?" comparison reads the stored `DeviceURI` from
+  `printers.conf` instead — otherwise a credentialed URI would be re-applied, and re-logged, on every
+  boot.
 
 ### The admin account
 
@@ -316,7 +397,14 @@ admin disabled, container keeps running): they must never take printing down.
 
 `/run/s6/container_environment/CUPS_ADMIN_PASSWORD` (and the `FILE__` variant) is narrowed to 0600
 — s6-overlay writes the environment world-readable, and print filters run as `lp` on untrusted
-documents.
+documents. The `FILE__CUPS_ADMIN_PASSWORD` *source* file is bind-mounted with the host file's mode
+(typically 0644 for a compose file-based secret) and is the user's, so it is not chmod'ed; instead the
+boot checks it with `s6-setuidgid lp test -r` and logs a `WARN` when the filters could read it.
+
+With `CUPS_MANAGED_CONFIG=false`, the posture summary reads `ServerName`, `Browsing` and
+`BrowseLocalProtocols` back from the user's `cupsd.conf` rather than reporting what the environment
+asked for: `CUPS_AIRPRINT=true` on an unmanaged file that does not browse starts D-Bus and Avahi but
+advertises nothing, and the log says exactly that instead of "ON - advertising".
 
 ## AirPrint internals
 
@@ -342,6 +430,18 @@ documents.
   client's real source address, so `Allow @LOCAL` does **not** match LAN clients there — hence the
   explicit private-range CIDRs in the default. On br0, LAN clients are on the container's own subnet
   and `@LOCAL` matches them.
+- **Bridge mode, the userland proxy.** Connections that `docker-proxy` relays — from the host to its
+  own published port, and on a dual-stack host IPv6 connections to a published port of this
+  IPv4-only container — reach cupsd from the bridge gateway (`172.17.0.1`), which the default list
+  admits twice (`@LOCAL`, `172.16.0.0/12`), whoever the client really is (verified for the localhost
+  case; the IPv6 relay could not be reproduced on a kernel without IPv6). Documented in the README's
+  Security section rather than changed: dropping `172.16.0.0/12`/`@LOCAL` from the default would cut
+  off other containers on the host and every LAN using 172.16/12.
+- **Bridge mode, the 426 redirect.** cupsd builds the `426 Upgrade Required` refresh URL from the
+  local socket address, not the `Host:` header, so in bridge mode `http://tower:631/admin` redirects
+  to `https://172.17.x.y:631/admin` — internal IP, internal port — which the LAN cannot reach. Hence
+  the template's `WebUI` is `https://[IP]:[PORT:631]/` (a deviation from the original spec's `http`):
+  a session that starts on https never meets the redirect.
 - Verified: process order dbus < avahi < cupsd; `ippfind _ipp._tcp,_universal` finds `M203 @
   unraid-cups` with the URF above (also `_ipps`, `_print`), inside the container and from a peer
   over multicast; survives `docker restart`; recovers after `pkill -KILL dbus-daemon`.
@@ -399,10 +499,22 @@ instead of an upstream image:
   tighter and quieter than "rebuild monthly".
 - `packages.txt` is the single source of truth for both, chosen over parsing the Dockerfile (a regex
   over a shell heredoc would be a second copy that nothing checks). After the build,
-  `gate.sh --check-image` proves the image's `/package_versions.txt` contains every version the
-  fingerprint claims, so a drift between the simulation and the real apt step is a red run, not a
-  silently stale fingerprint. A resolution that fails or comes back empty also fails the run: an
-  empty list would hash to a constant and security updates would quietly stop shipping.
+  `gate.sh --check-image` compares the image's `/package_versions.txt` with the fingerprint **in both
+  directions**: every resolved version must be in the image, and every package in the image must be
+  either resolved or the base's own, untouched one (the gate records the base's `dpkg-query` list in
+  the same `docker run` as the simulation). The second direction came out of review — an extra
+  `apt-get install less` in the Dockerfile passed the one-way check, leaving `less` outside the
+  fingerprint, so its security updates would never have triggered a rebuild. So a drift between the
+  simulation and the real apt step is a red run, not a silently stale fingerprint. A resolution that
+  fails or comes back empty also fails the run: an empty list would hash to a constant and security
+  updates would quietly stop shipping.
+- **Reading the published fingerprint fails closed.** Only a definite "not found" for `:latest`
+  counts as "nothing published yet". Any other registry error (403, 5xx, timeout) is retried three
+  times and then fails the run, because treating "could not read" as "no fingerprint" would publish
+  an image identical but for `BUILD_DATE` under a new `-ls` tag — a phantom update on every install.
+  openclaw's gate still maps every error to "publish"; here it is the outlier that was fixed. A
+  first publish that GHCR answers with "denied" instead of "not found" needs one manual run with
+  `force=true` (which skips the comparison).
 - Stored as the OCI **index annotation** `io.cookiesncache.inputs` on the published index and
   compared on each **daily** run; publish only on change (push to `main` on build-input paths and
   `workflow_dispatch` with `force` also run it). Same rationale as openclaw: no phantom updates for
@@ -424,6 +536,22 @@ instead of an upstream image:
   the rebuild itself happens automatically when Ubuntu ships.
 - Dependabot: `github-actions` + `docker` (the base digest), weekly, cooldown as in openclaw.
 
+### Pinned build tooling
+
+Two things execute the build besides the actions, and both are pinned by digest because a moving tag
+would change how the published image is built with no commit here (and a compromised tag would land
+in `:latest` on the next publish). Neither is part of the gate's fingerprint, and Dependabot bumps
+neither, so bump them deliberately — ideally in a PR of their own, which `pr-smoke` boots:
+
+- **The Dockerfile frontend:** `# syntax=docker/dockerfile:1@sha256:4edf897a…` = `docker/dockerfile`
+  **1.27.1** when pinned (2026-10-18; still the spec's `docker/dockerfile:1`). New digest:
+  `docker buildx imagetools inspect docker/dockerfile:1` (the `Digest:` line).
+- **BuildKit** (the `docker-container` builder `setup-buildx-action` starts, in `build.yml` and
+  `ci.yml`): `driver-opts: image=moby/buildkit:v0.33.1@sha256:cec9f139…`, the release
+  `moby/buildkit:buildx-stable-1` pointed at when pinned. New one: `docker buildx imagetools inspect
+  moby/buildkit:buildx-stable-1`, then find the `vX.Y.Z` tag with the same digest. Change both
+  workflows together.
+
 ### Smoke-test notes (learned the hard way)
 
 - `ippeveprinter` needs a reachable D-Bus system bus (`avahi_client_new` in `dnssd_init` is
@@ -431,9 +559,24 @@ instead of an upstream image:
   `CUPS_AIRPRINT=true` container, or start a private dbus-daemon first. It also treats a failed IPv6
   listener as fatal — fine on GitHub runners, but a kernel without IPv6 needs a shim.
 - CUPS job IDs are global across queues: assert on `<queue>-` and completion, not `<queue>-1`.
-- The TLS certificate is created lazily on the first https handshake (~0.25 s): do one handshake
-  before comparing fingerprints, and do not connect immediately after `docker network connect`.
+- Stock CUPS creates its certificate lazily on the first https handshake; here `init-cups-config`
+  creates it at boot, so the smoke test can compare the fingerprint on the container IP with the one
+  on localhost straight away. Still do not connect immediately after `docker network connect`.
+- Testing the policies' `Encryption Required` needs credentials sent *up front* with an IPP request.
+  The CUPS clients (`lp`, `lpadmin -h`) wait for a 401 challenge, which `DefaultEncryption Required`
+  already turns into a 426; `curl -u` sends Basic credentials up front but cannot build IPP. So
+  smoke.sh's `IPP_OP` is a few lines of Python that send the `Authorization` header with the first
+  `CUPS-Accept-Jobs` request.
 - Use the `has()` here-string matcher, never `grep -q` in a pipe under `pipefail`.
+
+## Licenses in the image
+
+`THIRD_PARTY_NOTICES.md` is **not** copied into the image (openclaw copies its notices to
+`/licenses`). The image's build inputs are exactly what the fingerprint covers — `Dockerfile`,
+`root/`, `.dockerignore` — so a notices-only edit can neither change the image nor need a publish;
+`.dockerignore` therefore excludes every `*.md`. The image already carries each package's own
+copyright file under `/usr/share/doc/<package>/copyright` and the full version list in
+`/package_versions.txt`; the README points at both.
 
 ## LinuxServer conventions
 
