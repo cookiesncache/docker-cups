@@ -485,6 +485,20 @@ fi
 mapfile -t PKGS <<< "$PKG_TEXT"
 [ -r "$APT_PIN_FILE" ] || { echo "::error::${APT_PIN_FILE} is missing - the simulation would not match the build"; exit 1; }
 
+# Pull the base first, with retries: GHCR throttles pulls now and then ("error from registry:
+# retry-after: ..."), and `docker run`'s implicit pull would report that as an apt failure.
+for attempt in 1 2 3; do
+    if pull_err="$(docker pull --quiet --platform linux/amd64 "$RESOLVE_REF" 2>&1 >/dev/null)"; then
+        break
+    fi
+    echo "::warning::pulling ${RESOLVE_REF} failed (attempt ${attempt}/3): $(printf '%s' "$pull_err" | tail -n1)"
+    if [ "$attempt" = 3 ]; then
+        echo "::error::could not pull ${RESOLVE_REF} - the gate cannot tell whether Ubuntu published anything"
+        exit 1
+    fi
+    sleep $((attempt * 15))
+done
+
 # The Dockerfile's apt step, simulated: same base, same pin, same flags, same order. `apt-get update`
 # progress goes to stderr so stdout carries only the simulation. Error-Mode=any makes a partially
 # failed update (one unreachable pocket) an error instead of a resolution against stale indexes. The
