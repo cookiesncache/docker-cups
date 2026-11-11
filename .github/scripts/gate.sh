@@ -505,21 +505,31 @@ done
 # package names travel as positional arguments, never through a shell string.
 # The base's own package list comes first, tagged "BASE ": --check-image needs it to tell the base's
 # untouched packages from ones the build added. (apt_inst_versions only reads "Inst " lines.)
+# Retried like the pull above: Error-Mode=any also makes a passing network blip fatal (the container
+# failing to resolve archive.ubuntu.com, a mirror dropping a connection), and a simulation has no side
+# effects to repeat. Each attempt's apt errors still reach the job log on stderr.
 echo "Resolving ${#PKGS[@]} packages from ${PACKAGES_FILE} inside ${RESOLVE_REF} ..."
-# shellcheck disable=SC2016 # the script runs, and expands, inside the container
-if ! SIM="$(docker run --rm --platform linux/amd64 --entrypoint /bin/bash \
-                -v "${PWD}/${APT_PIN_FILE}:${APT_PIN_TARGET}:ro" \
-                "$RESOLVE_REF" -c '
-                    set -euo pipefail
-                    export DEBIAN_FRONTEND=noninteractive
-                    dpkg-query -W -f="BASE \${Package}=\${Version}\n"
-                    apt-get -qq -o APT::Update::Error-Mode=any update >&2
-                    apt-get -s -y upgrade
-                    apt-get -s -y install --no-install-recommends "$@"
-                ' resolve "${PKGS[@]}")"; then
-    echo "::error::could not resolve the package set inside ${RESOLVE_REF} - the gate cannot tell whether Ubuntu published anything"
-    exit 1
-fi
+for attempt in 1 2 3; do
+    # shellcheck disable=SC2016 # the script runs, and expands, inside the container
+    if SIM="$(docker run --rm --platform linux/amd64 --entrypoint /bin/bash \
+                    -v "${PWD}/${APT_PIN_FILE}:${APT_PIN_TARGET}:ro" \
+                    "$RESOLVE_REF" -c '
+                        set -euo pipefail
+                        export DEBIAN_FRONTEND=noninteractive
+                        dpkg-query -W -f="BASE \${Package}=\${Version}\n"
+                        apt-get -qq -o APT::Update::Error-Mode=any update >&2
+                        apt-get -s -y upgrade
+                        apt-get -s -y install --no-install-recommends "$@"
+                    ' resolve "${PKGS[@]}")"; then
+        break
+    fi
+    echo "::warning::resolving packages inside ${RESOLVE_REF} failed (attempt ${attempt}/3)"
+    if [ "$attempt" = 3 ]; then
+        echo "::error::could not resolve the package set inside ${RESOLVE_REF} - the gate cannot tell whether Ubuntu published anything"
+        exit 1
+    fi
+    sleep $((attempt * 15))
+done
 BASE_PKGS="$(printf '%s\n' "$SIM" | sed -n 's/^BASE //p' | LC_ALL=C sort -u)"
 if ! valid_resolution "$BASE_PKGS"; then
     echo "::error::could not read the base image's own package list (dpkg-query) - --check-image would have nothing to compare against"
