@@ -8,7 +8,7 @@
 # Pinned by digest so the base cannot move under us; Dependabot's docker ecosystem proposes bumps
 # as a one-line PR. resolute is where CUPS 2.4.16 / cups-filters 2.0 / ghostscript 10.06 live; the
 # image is arch-neutral (CI builds amd64 only, for Unraid).
-FROM ghcr.io/linuxserver/baseimage-ubuntu:resolute@sha256:0fcb66011e543262765c5ce44d9b84cfd7ef467c173cd45821feec556833b68c
+FROM ghcr.io/linuxserver/baseimage-ubuntu:resolute@sha256:e044df9763cfadf3081e6b7a2e949809661c9e751b6ce65040075972c9b35587
 
 # LSIO_FIRST_PARTY=false: this is a custom/unofficial image on the LSIO base, so the base init must
 # not overwrite our own init-adduser/branding (see LinuxServer's container-branding docs).
